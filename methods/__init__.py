@@ -1,4 +1,5 @@
 from methods.weight_methods import (
+    ComposableMTL,
     METHODS,
     MGDA,
     STL,

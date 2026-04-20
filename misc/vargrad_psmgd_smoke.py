@@ -40,39 +40,65 @@ def main():
     n_tasks = 3
 
     model = ToyMTL(n_tasks=n_tasks).to(device)
-    method = WeightMethods(
-        "vargrad_psmgd",
-        n_tasks=n_tasks,
-        device=device,
-        beta=0.9,
-        update_weights_every=3,
-        weight_smoothing=0.5,
-    )
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
-
-    for step in range(6):
-        x = torch.randn(12, 8, device=device)
-        outputs = model(x)
-        losses = torch.stack(
-            [
-                (outputs[0] - 0.5).pow(2).mean(),
-                (outputs[1] + 0.25).abs().mean(),
-                (outputs[2]).pow(2).mean(),
-            ]
+    method_specs = [
+        (
+            "modular",
+            dict(
+                preprocessing="identity",
+                solver="uniform",
+                scheduler="every_step",
+                use_momentum=False,
+            ),
+        ),
+        (
+            "modular",
+            dict(
+                preprocessing="vargrad",
+                solver="fairgrad",
+                scheduler="psmgd_periodic",
+                use_momentum=True,
+                beta_v=0.9,
+                beta_m=0.9,
+                psmgd_R=3,
+                psmgd_alpha=0.5,
+                alpha=1.0,
+            ),
         )
+    ]
 
-        optimizer.zero_grad()
-        loss, extra = method.backward(
-            losses=losses,
-            shared_parameters=list(model.shared_parameters()),
-            task_specific_parameters=list(model.task_specific_parameters()),
+    for method_name, method_kwargs in method_specs:
+        print(f"== {method_name} {method_kwargs} ==")
+        method = WeightMethods(
+            method_name,
+            n_tasks=n_tasks,
+            device=device,
+            **method_kwargs,
         )
-        optimizer.step()
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
 
-        print(
-            f"step={step} loss={loss.item():.4f} "
-            f"weights={extra['weights'].tolist()} updated={extra['updated_weights']}"
-        )
+        for step in range(4):
+            x = torch.randn(12, 8, device=device)
+            outputs = model(x)
+            losses = torch.stack(
+                [
+                    (outputs[0] - 0.5).pow(2).mean(),
+                    (outputs[1] + 0.25).abs().mean(),
+                    (outputs[2]).pow(2).mean(),
+                ]
+            )
+
+            optimizer.zero_grad()
+            loss, extra = method.backward(
+                losses=losses,
+                shared_parameters=list(model.shared_parameters()),
+                task_specific_parameters=list(model.task_specific_parameters()),
+            )
+            optimizer.step()
+
+            print(
+                f"step={step} loss={loss.item():.4f} "
+                f"weights={extra['weights'].tolist()} updated={extra['updated_weights']}"
+            )
 
 
 if __name__ == "__main__":

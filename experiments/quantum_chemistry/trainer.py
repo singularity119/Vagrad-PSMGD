@@ -22,6 +22,7 @@ from experiments.utils import (
     common_parser,
     extract_weight_method_parameters_from_args,
     get_device,
+    resolve_composable_config_from_args,
     set_logger,
     set_seed,
     str2bool,
@@ -222,6 +223,14 @@ def main(
                 name = f"{args.method}_gamma{args.gamma}_wlr{args.method_params_lr}_scale_sd{args.seed}"
             else:
                 name = f"{args.method}_gamma{args.gamma}_wlr{args.method_params_lr}_sd{args.seed}"
+        elif args.method in ["modular", "compositional"]:
+            config = resolve_composable_config_from_args(args)
+            scale_suffix = "_scale" if args.scale_y else ""
+            name = (
+                f"{args.method}_{config['preprocessing']}_{config['solver']}"
+                f"_{config['scheduler']}_mom{int(config['use_momentum'])}"
+                f"{scale_suffix}_sd{args.seed}"
+            )
         elif "fairgrad" in args.method:
             if args.scale_y:
                 name = f"{args.method}_alpha{args.alpha}_scale_sd{args.seed}"

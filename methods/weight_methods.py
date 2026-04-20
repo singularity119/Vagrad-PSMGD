@@ -885,35 +885,57 @@ class FairGrad(WeightMethod):
         return None, {"GTG": GTG, "weights": w}  # NOTE: to align with all other weight methods
 
 
-class VarGradPSMGD(WeightMethod):
-    """VarGrad stabilization followed by periodic PSMGD-style weight reuse."""
+class ComposableMTL(WeightMethod):
+    """Composable preprocessing + solver + scheduler MTL framework."""
 
     def __init__(
         self,
         n_tasks,
         device: torch.device,
-        beta=0.9,
-        update_weights_every=10,
-        weight_smoothing=0.5,
+        preprocessing="identity",
+        solver="fairgrad",
+        scheduler="every_step",
+        use_momentum=True,
+        beta_v=0.9,
+        beta_m=0.9,
+        psmgd_R=10,
+        psmgd_alpha=0.5,
+        alpha=1.0,
+        c=0.4,
+        nashmtl_optim_niter=20,
         max_norm=1.0,
     ):
         super().__init__(n_tasks, device=device)
-        if not 0.0 <= beta < 1.0:
-            raise ValueError("beta must satisfy 0 <= beta < 1.")
-        if update_weights_every < 1:
-            raise ValueError("update_weights_every must be >= 1.")
-        if not 0.0 <= weight_smoothing <= 1.0:
-            raise ValueError("weight_smoothing must satisfy 0 <= a <= 1.")
+        if preprocessing not in ["identity", "vargrad"]:
+            raise ValueError(f"unknown preprocessing {preprocessing}.")
+        if solver not in ["uniform", "fairgrad", "mgda", "cagrad", "nashmtl"]:
+            raise ValueError(f"unknown solver {solver}.")
+        if scheduler not in ["every_step", "psmgd_periodic"]:
+            raise ValueError(f"unknown scheduler {scheduler}.")
+        if not 0.0 <= beta_v < 1.0:
+            raise ValueError("beta_v must satisfy 0 <= beta_v < 1.")
+        if not 0.0 <= beta_m < 1.0:
+            raise ValueError("beta_m must satisfy 0 <= beta_m < 1.")
+        if psmgd_R < 1:
+            raise ValueError("psmgd_R must be >= 1.")
+        if not 0.0 <= psmgd_alpha <= 1.0:
+            raise ValueError("psmgd_alpha must satisfy 0 <= alpha <= 1.")
 
-        self.beta = beta
-        self.update_weights_every = update_weights_every
-        self.weight_smoothing = weight_smoothing
+        self.preprocessing = preprocessing
+        self.solver_name = solver
+        self.scheduler_name = scheduler
+        self.use_momentum = use_momentum
+        self.beta_v = beta_v
+        self.beta_m = beta_m
+        self.psmgd_R = psmgd_R
+        self.psmgd_alpha = psmgd_alpha
+        self.fairgrad_alpha = alpha
+        self.cagrad_c = c
         self.max_norm = max_norm
-        self.solver = MinNormSolver()
 
         self.step = 0
         self.prev_task_grads = None
-        self.vargrad_momentum = None
+        self.task_momentum = None
         self.weights = torch.full(
             (n_tasks,),
             1.0 / max(n_tasks, 1),
@@ -922,6 +944,28 @@ class VarGradPSMGD(WeightMethod):
         )
         self.last_candidate_weights = self.weights.clone()
         self._latest_shared_grad = None
+
+        # Reuse original solver implementations whenever possible.
+        self._mgda_solver = MinNormSolver()
+        self._fairgrad_solver = FairGrad(
+            n_tasks=n_tasks,
+            device=device,
+            alpha=alpha,
+            max_norm=max_norm,
+        )
+        self._cagrad_solver = CAGrad(
+            n_tasks=n_tasks,
+            device=device,
+            c=c,
+            max_norm=max_norm,
+        )
+        self._nashmtl_solver = NashMTL(
+            n_tasks=n_tasks,
+            device=device,
+            max_norm=max_norm,
+            update_weights_every=1,
+            optim_niter=nashmtl_optim_niter,
+        )
 
     @staticmethod
     def _to_parameter_list(
@@ -974,29 +1018,47 @@ class VarGradPSMGD(WeightMethod):
             return torch.full_like(weights, 1.0 / self.n_tasks)
         return weights / denom
 
-    def _apply_vargrad_filter(self, task_grads: torch.Tensor) -> torch.Tensor:
-        if self.prev_task_grads is None:
-            corrected_grads = task_grads
+    def _apply_preprocessing(self, raw_task_grads: torch.Tensor) -> torch.Tensor:
+        if self.preprocessing != "vargrad":
+            corrected_grads = raw_task_grads
+        elif self.prev_task_grads is None:
+            corrected_grads = raw_task_grads
         else:
-            coeff = self.beta / max(1.0 - self.beta, EPS)
-            corrected_grads = task_grads + coeff * (
-                task_grads - self.prev_task_grads
+            coeff = self.beta_v / max(1.0 - self.beta_v, EPS)
+            corrected_grads = raw_task_grads + coeff * (
+                raw_task_grads - self.prev_task_grads
             )
 
-        if self.vargrad_momentum is None:
-            self.vargrad_momentum = torch.zeros_like(corrected_grads)
+        self.prev_task_grads = raw_task_grads.detach().clone()
+        return corrected_grads
 
-        self.vargrad_momentum = (
-            self.beta * self.vargrad_momentum + (1.0 - self.beta) * corrected_grads
+    def _apply_momentum(self, processed_task_grads: torch.Tensor) -> torch.Tensor:
+        if not self.use_momentum:
+            self.task_momentum = processed_task_grads.detach().clone()
+            return processed_task_grads
+
+        if self.task_momentum is None:
+            self.task_momentum = torch.zeros_like(processed_task_grads)
+
+        self.task_momentum = (
+            self.beta_m * self.task_momentum
+            + (1.0 - self.beta_m) * processed_task_grads
         )
-        self.prev_task_grads = task_grads.detach().clone()
-        return self.vargrad_momentum
+        return self.task_momentum
 
-    def _solve_psmgd_weights(self, stabilized_task_grads: torch.Tensor) -> torch.Tensor:
+    def _solve_candidate_weights(self, task_grads: torch.Tensor) -> torch.Tensor:
+        if self.solver_name == "uniform":
+            return torch.full(
+                (self.n_tasks,),
+                1.0 / self.n_tasks,
+                device=self.device,
+                dtype=torch.float32,
+            )
+
         if self.n_tasks == 1:
             return torch.ones(1, device=self.device)
 
-        if stabilized_task_grads.numel() == 0 or torch.norm(stabilized_task_grads) <= EPS:
+        if task_grads.numel() == 0 or torch.norm(task_grads) <= EPS:
             return torch.full(
                 (self.n_tasks,),
                 1.0 / self.n_tasks,
@@ -1005,12 +1067,40 @@ class VarGradPSMGD(WeightMethod):
             )
 
         try:
-            solver_inputs = [
-                [stabilized_task_grads[:, task_idx].detach()]
-                for task_idx in range(self.n_tasks)
-            ]
-            solution, _ = self.solver.find_min_norm_element(solver_inputs)
-            weights = torch.from_numpy(solution.astype(np.float32)).to(self.device)
+            if self.solver_name == "fairgrad":
+                _, _, w_cpu = self._fairgrad_solver.fairgrad(
+                    task_grads, alpha=self.fairgrad_alpha
+                )
+                weights = torch.from_numpy(w_cpu.astype(np.float32)).to(self.device)
+            elif self.solver_name == "mgda":
+                solver_inputs = [
+                    [task_grads[:, task_idx].detach()]
+                    for task_idx in range(self.n_tasks)
+                ]
+                solution, _ = self._mgda_solver.find_min_norm_element(solver_inputs)
+                weights = torch.from_numpy(solution.astype(np.float32)).to(self.device)
+            elif self.solver_name == "cagrad":
+                _, _, w_cpu = self._cagrad_solver.cagrad(
+                    task_grads, alpha=self.cagrad_c, rescale=1
+                )
+                weights = torch.from_numpy(w_cpu.astype(np.float32)).to(self.device)
+            elif self.solver_name == "nashmtl":
+                if self._nashmtl_solver.step == 0:
+                    self._nashmtl_solver._init_optim_problem()
+                GTG = task_grads.t().mm(task_grads)
+                self._nashmtl_solver.normalization_factor = (
+                    torch.norm(GTG).detach().cpu().numpy().reshape((1,))
+                )
+                normalizer = max(
+                    float(self._nashmtl_solver.normalization_factor.item()), EPS
+                )
+                solution = self._nashmtl_solver.solve_optimization(
+                    (GTG / normalizer).cpu().detach().numpy()
+                )
+                self._nashmtl_solver.step += 1
+                weights = torch.from_numpy(solution.astype(np.float32)).to(self.device)
+            else:
+                raise ValueError(f"unsupported solver {self.solver_name}.")
         except Exception:
             weights = torch.full(
                 (self.n_tasks,),
@@ -1021,29 +1111,34 @@ class VarGradPSMGD(WeightMethod):
 
         return self._normalize_weights(weights)
 
-    def _update_psmgd_weights(
-        self, stabilized_task_grads: torch.Tensor
+    def _apply_scheduler(
+        self, candidate_weights: torch.Tensor
     ) -> Tuple[torch.Tensor, bool]:
-        updated_weights = (self.step % self.update_weights_every) == 0
+        candidate_weights = self._normalize_weights(candidate_weights)
+        self.last_candidate_weights = candidate_weights
+
+        if self.scheduler_name == "every_step":
+            self.weights = candidate_weights
+            return self.weights, True
+
+        updated_weights = (self.step % self.psmgd_R) == 0
         if not updated_weights:
             return self.weights, False
 
-        candidate_weights = self._solve_psmgd_weights(stabilized_task_grads)
-        self.last_candidate_weights = candidate_weights
         if self.step == 0:
             self.weights = candidate_weights
         else:
             self.weights = self._normalize_weights(
-                self.weight_smoothing * self.weights
-                + (1.0 - self.weight_smoothing) * candidate_weights
+                self.psmgd_alpha * self.weights
+                + (1.0 - self.psmgd_alpha) * candidate_weights
             )
         return self.weights, True
 
     @staticmethod
     def _merge_task_grads(
-        stabilized_task_grads: torch.Tensor, task_weights: torch.Tensor
+        task_grads: torch.Tensor, task_weights: torch.Tensor
     ) -> torch.Tensor:
-        return stabilized_task_grads @ task_weights.detach()
+        return (task_grads * task_weights.detach().view(1, -1)).sum(dim=1)
 
     @staticmethod
     def _assign_grad_vector(
@@ -1071,12 +1166,14 @@ class VarGradPSMGD(WeightMethod):
             }
 
         raw_task_grads = self._collect_shared_task_grads(losses, shared_parameters)
-        stabilized_task_grads = self._apply_vargrad_filter(raw_task_grads)
-        task_weights, updated_weights = self._update_psmgd_weights(
-            stabilized_task_grads
+        preprocessed_task_grads = self._apply_preprocessing(raw_task_grads)
+        solver_task_grads = self._apply_momentum(preprocessed_task_grads)
+        candidate_weights = self._solve_candidate_weights(solver_task_grads)
+        task_weights, updated_weights = self._apply_scheduler(
+            candidate_weights
         )
         self._latest_shared_grad = self._merge_task_grads(
-            stabilized_task_grads, task_weights
+            solver_task_grads, task_weights
         )
         self.step += 1
 
@@ -1085,8 +1182,14 @@ class VarGradPSMGD(WeightMethod):
             "weights": task_weights.detach().clone(),
             "candidate_weights": self.last_candidate_weights.detach().clone(),
             "updated_weights": updated_weights,
+            "preprocessing": self.preprocessing,
+            "solver": self.solver_name,
+            "scheduler": self.scheduler_name,
             "raw_shared_grad_norms": raw_task_grads.norm(dim=0).detach().cpu(),
-            "stabilized_shared_grad_norms": stabilized_task_grads.norm(dim=0)
+            "preprocessed_shared_grad_norms": preprocessed_task_grads.norm(dim=0)
+            .detach()
+            .cpu(),
+            "solver_shared_grad_norms": solver_task_grads.norm(dim=0)
             .detach()
             .cpu(),
         }
@@ -1117,6 +1220,33 @@ class VarGradPSMGD(WeightMethod):
                 torch.nn.utils.clip_grad_norm_(shared_parameters, self.max_norm)
 
         return weighted_loss, extra_outputs
+
+
+class VarGradPSMGD(ComposableMTL):
+    """Backward-compatible wrapper for the original fixed VarGrad+PSMGD variant."""
+
+    def __init__(
+        self,
+        n_tasks,
+        device: torch.device,
+        beta=0.9,
+        update_weights_every=10,
+        weight_smoothing=0.5,
+        max_norm=1.0,
+    ):
+        super().__init__(
+            n_tasks=n_tasks,
+            device=device,
+            preprocessing="vargrad",
+            solver="mgda",
+            scheduler="psmgd_periodic",
+            use_momentum=True,
+            beta_v=beta,
+            beta_m=beta,
+            psmgd_R=update_weights_every,
+            psmgd_alpha=weight_smoothing,
+            max_norm=max_norm,
+        )
 
 
 class GradDrop(WeightMethod):
@@ -1598,6 +1728,8 @@ METHODS = dict(
     nashmtl=NashMTL,
     famo=FAMO,
     fairgrad=FairGrad,
+    modular=ComposableMTL,
+    compositional=ComposableMTL,
     vargrad_psmgd=VarGradPSMGD,
     vagrad_psmgd=VarGradPSMGD,
 )

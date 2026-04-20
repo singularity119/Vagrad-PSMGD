@@ -69,6 +69,70 @@ common_parser.add_argument(
 common_parser.add_argument("--c", type=float, default=0.4, help="c for CAGrad alg.")
 # fairgrad
 common_parser.add_argument("--alpha", type=float, default=1.0, help="alpha for FairGrad alg.")
+# modular framework
+common_parser.add_argument(
+    "--preprocessing",
+    type=str,
+    choices=["identity", "vargrad"],
+    default="identity",
+    help="gradient preprocessing module",
+)
+common_parser.add_argument(
+    "--solver",
+    type=str,
+    choices=["uniform", "fairgrad", "mgda", "cagrad", "nashmtl"],
+    default="fairgrad",
+    help="baseline solver used to generate candidate task weights",
+)
+common_parser.add_argument(
+    "--scheduler",
+    type=str,
+    choices=["every_step", "psmgd_periodic"],
+    default="every_step",
+    help="weight scheduling strategy",
+)
+common_parser.add_argument(
+    "--use-vargrad",
+    type=str2bool,
+    default=None,
+    help="optional override for preprocessing module",
+)
+common_parser.add_argument(
+    "--use-momentum",
+    type=str2bool,
+    default=True,
+    help="whether to apply momentum after preprocessing",
+)
+common_parser.add_argument(
+    "--use-psmgd",
+    type=str2bool,
+    default=None,
+    help="optional override for scheduler",
+)
+common_parser.add_argument(
+    "--beta-v",
+    type=float,
+    default=0.9,
+    help="beta for VarGrad preprocessing",
+)
+common_parser.add_argument(
+    "--beta-m",
+    type=float,
+    default=0.9,
+    help="beta for momentum smoothing",
+)
+common_parser.add_argument(
+    "--psmgd-R",
+    type=int,
+    default=10,
+    help="period length for PSMGD-style updates",
+)
+common_parser.add_argument(
+    "--psmgd-alpha",
+    type=float,
+    default=0.5,
+    help="EMA smoothing coefficient for periodic weight refreshes",
+)
 # vargrad + psmgd
 common_parser.add_argument(
     "--vargrad-beta",
@@ -137,7 +201,30 @@ def get_device(no_cuda=False, gpus="0"):
     )
 
 
+def resolve_composable_config_from_args(args):
+    preprocessing = args.preprocessing
+    if args.use_vargrad is True:
+        preprocessing = "vargrad"
+    elif args.use_vargrad is False:
+        preprocessing = "identity"
+
+    scheduler = args.scheduler
+    if args.use_psmgd is True:
+        scheduler = "psmgd_periodic"
+    elif args.use_psmgd is False:
+        scheduler = "every_step"
+
+    return dict(
+        preprocessing=preprocessing,
+        solver=args.solver,
+        scheduler=scheduler,
+        use_momentum=args.use_momentum,
+    )
+
+
 def extract_weight_method_parameters_from_args(args):
+    composable_config = resolve_composable_config_from_args(args)
+
     weight_methods_parameters = defaultdict(dict)
     weight_methods_parameters.update(
         dict(
@@ -154,6 +241,34 @@ def extract_weight_method_parameters_from_args(args):
                       w_lr=args.method_params_lr,
                       max_norm=args.max_norm),
             fairgrad=dict(alpha=args.alpha, max_norm=args.max_norm),
+            modular=dict(
+                preprocessing=composable_config["preprocessing"],
+                solver=composable_config["solver"],
+                scheduler=composable_config["scheduler"],
+                use_momentum=composable_config["use_momentum"],
+                beta_v=args.beta_v,
+                beta_m=args.beta_m,
+                psmgd_R=args.psmgd_R,
+                psmgd_alpha=args.psmgd_alpha,
+                alpha=args.alpha,
+                c=args.c,
+                nashmtl_optim_niter=args.nashmtl_optim_niter,
+                max_norm=args.max_norm,
+            ),
+            compositional=dict(
+                preprocessing=composable_config["preprocessing"],
+                solver=composable_config["solver"],
+                scheduler=composable_config["scheduler"],
+                use_momentum=composable_config["use_momentum"],
+                beta_v=args.beta_v,
+                beta_m=args.beta_m,
+                psmgd_R=args.psmgd_R,
+                psmgd_alpha=args.psmgd_alpha,
+                alpha=args.alpha,
+                c=args.c,
+                nashmtl_optim_niter=args.nashmtl_optim_niter,
+                max_norm=args.max_norm,
+            ),
             vargrad_psmgd=dict(
                 beta=args.vargrad_beta,
                 update_weights_every=args.psmgd_update_every,
