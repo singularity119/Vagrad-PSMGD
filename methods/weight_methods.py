@@ -886,7 +886,7 @@ class FairGrad(WeightMethod):
 
 
 class VarGradPSMGD(WeightMethod):
-    """VarGrad filtering with periodically refreshed MGDA weights."""
+    """VarGrad stabilization followed by periodic PSMGD-style weight reuse."""
 
     def __init__(
         self,
@@ -912,14 +912,15 @@ class VarGradPSMGD(WeightMethod):
         self.solver = MinNormSolver()
 
         self.step = 0
-        self.prev_grads = None
-        self.momentum_grads = None
+        self.prev_task_grads = None
+        self.vargrad_momentum = None
         self.weights = torch.full(
             (n_tasks,),
             1.0 / max(n_tasks, 1),
             device=device,
             dtype=torch.float32,
         )
+        self.last_candidate_weights = self.weights.clone()
         self._latest_shared_grad = None
 
     @staticmethod
@@ -973,27 +974,29 @@ class VarGradPSMGD(WeightMethod):
             return torch.full_like(weights, 1.0 / self.n_tasks)
         return weights / denom
 
-    def _update_filtered_grads(self, task_grads: torch.Tensor) -> torch.Tensor:
-        if self.prev_grads is None:
+    def _apply_vargrad_filter(self, task_grads: torch.Tensor) -> torch.Tensor:
+        if self.prev_task_grads is None:
             corrected_grads = task_grads
         else:
             coeff = self.beta / max(1.0 - self.beta, EPS)
-            corrected_grads = task_grads + coeff * (task_grads - self.prev_grads)
+            corrected_grads = task_grads + coeff * (
+                task_grads - self.prev_task_grads
+            )
 
-        if self.momentum_grads is None:
-            self.momentum_grads = torch.zeros_like(corrected_grads)
+        if self.vargrad_momentum is None:
+            self.vargrad_momentum = torch.zeros_like(corrected_grads)
 
-        self.momentum_grads = (
-            self.beta * self.momentum_grads + (1.0 - self.beta) * corrected_grads
+        self.vargrad_momentum = (
+            self.beta * self.vargrad_momentum + (1.0 - self.beta) * corrected_grads
         )
-        self.prev_grads = task_grads.detach().clone()
-        return self.momentum_grads
+        self.prev_task_grads = task_grads.detach().clone()
+        return self.vargrad_momentum
 
-    def _solve_mgda_weights(self, task_grads: torch.Tensor) -> torch.Tensor:
+    def _solve_psmgd_weights(self, stabilized_task_grads: torch.Tensor) -> torch.Tensor:
         if self.n_tasks == 1:
             return torch.ones(1, device=self.device)
 
-        if task_grads.numel() == 0 or torch.norm(task_grads) <= EPS:
+        if stabilized_task_grads.numel() == 0 or torch.norm(stabilized_task_grads) <= EPS:
             return torch.full(
                 (self.n_tasks,),
                 1.0 / self.n_tasks,
@@ -1003,7 +1006,7 @@ class VarGradPSMGD(WeightMethod):
 
         try:
             solver_inputs = [
-                [task_grads[:, task_idx].detach()]
+                [stabilized_task_grads[:, task_idx].detach()]
                 for task_idx in range(self.n_tasks)
             ]
             solution, _ = self.solver.find_min_norm_element(solver_inputs)
@@ -1017,6 +1020,30 @@ class VarGradPSMGD(WeightMethod):
             )
 
         return self._normalize_weights(weights)
+
+    def _update_psmgd_weights(
+        self, stabilized_task_grads: torch.Tensor
+    ) -> Tuple[torch.Tensor, bool]:
+        updated_weights = (self.step % self.update_weights_every) == 0
+        if not updated_weights:
+            return self.weights, False
+
+        candidate_weights = self._solve_psmgd_weights(stabilized_task_grads)
+        self.last_candidate_weights = candidate_weights
+        if self.step == 0:
+            self.weights = candidate_weights
+        else:
+            self.weights = self._normalize_weights(
+                self.weight_smoothing * self.weights
+                + (1.0 - self.weight_smoothing) * candidate_weights
+            )
+        return self.weights, True
+
+    @staticmethod
+    def _merge_task_grads(
+        stabilized_task_grads: torch.Tensor, task_weights: torch.Tensor
+    ) -> torch.Tensor:
+        return stabilized_task_grads @ task_weights.detach()
 
     @staticmethod
     def _assign_grad_vector(
@@ -1039,32 +1066,29 @@ class VarGradPSMGD(WeightMethod):
             weighted_loss = losses.mean()
             return weighted_loss, {
                 "weights": self.weights.detach().clone(),
+                "candidate_weights": self.last_candidate_weights.detach().clone(),
                 "updated_weights": False,
             }
 
-        task_grads = self._collect_shared_task_grads(losses, shared_parameters)
-        filtered_grads = self._update_filtered_grads(task_grads)
-
-        updated_weights = (self.step % self.update_weights_every) == 0
-        if updated_weights:
-            candidate_weights = self._solve_mgda_weights(filtered_grads)
-            if self.step == 0:
-                self.weights = candidate_weights
-            else:
-                self.weights = self._normalize_weights(
-                    self.weight_smoothing * self.weights
-                    + (1.0 - self.weight_smoothing) * candidate_weights
-                )
-
-        self._latest_shared_grad = filtered_grads @ self.weights.detach()
+        raw_task_grads = self._collect_shared_task_grads(losses, shared_parameters)
+        stabilized_task_grads = self._apply_vargrad_filter(raw_task_grads)
+        task_weights, updated_weights = self._update_psmgd_weights(
+            stabilized_task_grads
+        )
+        self._latest_shared_grad = self._merge_task_grads(
+            stabilized_task_grads, task_weights
+        )
         self.step += 1
 
-        weighted_loss = torch.sum(losses * self.weights.detach())
+        weighted_loss = torch.sum(losses * task_weights.detach())
         extra_outputs = {
-            "weights": self.weights.detach().clone(),
+            "weights": task_weights.detach().clone(),
+            "candidate_weights": self.last_candidate_weights.detach().clone(),
             "updated_weights": updated_weights,
-            "raw_shared_grad_norms": task_grads.norm(dim=0).detach().cpu(),
-            "filtered_shared_grad_norms": filtered_grads.norm(dim=0).detach().cpu(),
+            "raw_shared_grad_norms": raw_task_grads.norm(dim=0).detach().cpu(),
+            "stabilized_shared_grad_norms": stabilized_task_grads.norm(dim=0)
+            .detach()
+            .cpu(),
         }
         return weighted_loss, extra_outputs
 
