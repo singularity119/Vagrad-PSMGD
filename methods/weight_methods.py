@@ -3,11 +3,18 @@ import random
 from abc import abstractmethod
 from typing import Dict, List, Tuple, Union
 
-import cvxpy as cp
+try:
+    import cvxpy as cp
+except ImportError:
+    cp = None
 import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy.optimize import minimize, least_squares
+try:
+    from scipy.optimize import minimize, least_squares
+except ImportError:
+    minimize = None
+    least_squares = None
 
 from methods.min_norm_solvers import MinNormSolver, gradient_normalizers
 
@@ -209,6 +216,8 @@ class NashMTL(WeightMethod):
         return phi_alpha
 
     def _init_optim_problem(self):
+        if cp is None:
+            raise ImportError("cvxpy is required to use NashMTL.")
         self.alpha_param = cp.Variable(shape=(self.n_tasks,), nonneg=True)
         self.prvs_alpha_param = cp.Parameter(
             shape=(self.n_tasks,), value=self.prvs_alpha
@@ -685,6 +694,8 @@ class CAGrad(WeightMethod):
         return GTG, w_cpu
 
     def cagrad(self, grads, alpha=0.5, rescale=1):
+        if minimize is None:
+            raise ImportError("scipy is required to use CAGrad.")
         GG = grads.t().mm(grads).cpu()  # [num_tasks, num_tasks]
         g0_norm = (GG.mean() + 1e-8).sqrt()  # norm of the average gradient
 
@@ -809,6 +820,8 @@ class FairGrad(WeightMethod):
         return GTG, w_cpu
 
     def fairgrad(self, grads, alpha=1.0):
+        if least_squares is None:
+            raise ImportError("scipy is required to use FairGrad.")
         GG = grads.t().mm(grads).cpu()  # [num_tasks, num_tasks]
 
         x_start = np.ones(self.n_tasks) / self.n_tasks
@@ -870,6 +883,216 @@ class FairGrad(WeightMethod):
         if self.max_norm > 0:
             torch.nn.utils.clip_grad_norm_(shared_parameters, self.max_norm)
         return None, {"GTG": GTG, "weights": w}  # NOTE: to align with all other weight methods
+
+
+class VarGradPSMGD(WeightMethod):
+    """VarGrad filtering with periodically refreshed MGDA weights."""
+
+    def __init__(
+        self,
+        n_tasks,
+        device: torch.device,
+        beta=0.9,
+        update_weights_every=10,
+        weight_smoothing=0.5,
+        max_norm=1.0,
+    ):
+        super().__init__(n_tasks, device=device)
+        if not 0.0 <= beta < 1.0:
+            raise ValueError("beta must satisfy 0 <= beta < 1.")
+        if update_weights_every < 1:
+            raise ValueError("update_weights_every must be >= 1.")
+        if not 0.0 <= weight_smoothing <= 1.0:
+            raise ValueError("weight_smoothing must satisfy 0 <= a <= 1.")
+
+        self.beta = beta
+        self.update_weights_every = update_weights_every
+        self.weight_smoothing = weight_smoothing
+        self.max_norm = max_norm
+        self.solver = MinNormSolver()
+
+        self.step = 0
+        self.prev_grads = None
+        self.momentum_grads = None
+        self.weights = torch.full(
+            (n_tasks,),
+            1.0 / max(n_tasks, 1),
+            device=device,
+            dtype=torch.float32,
+        )
+        self._latest_shared_grad = None
+
+    @staticmethod
+    def _to_parameter_list(
+        parameters: Union[List[torch.nn.parameter.Parameter], torch.Tensor, None]
+    ) -> List[torch.nn.parameter.Parameter]:
+        if parameters is None:
+            return []
+        if isinstance(parameters, torch.Tensor):
+            return [parameters]
+        return list(parameters)
+
+    @staticmethod
+    def _flatten_grad_tuple(
+        grads: Tuple[torch.Tensor, ...],
+        parameters: List[torch.nn.parameter.Parameter],
+    ) -> torch.Tensor:
+        flat_grads = []
+        for grad, parameter in zip(grads, parameters):
+            if grad is None:
+                flat_grads.append(torch.zeros_like(parameter).reshape(-1))
+            else:
+                flat_grads.append(grad.reshape(-1))
+
+        if not flat_grads:
+            if parameters:
+                return torch.zeros(0, device=parameters[0].device)
+            return torch.zeros(0)
+        return torch.cat(flat_grads, dim=0)
+
+    def _collect_shared_task_grads(
+        self,
+        losses: torch.Tensor,
+        shared_parameters: List[torch.nn.parameter.Parameter],
+    ) -> torch.Tensor:
+        task_grads = []
+        for loss in losses:
+            grad_tuple = torch.autograd.grad(
+                loss,
+                shared_parameters,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            task_grads.append(self._flatten_grad_tuple(grad_tuple, shared_parameters))
+        return torch.stack(task_grads, dim=1)
+
+    def _normalize_weights(self, weights: torch.Tensor) -> torch.Tensor:
+        weights = weights.clamp_min(0.0)
+        denom = weights.sum()
+        if denom <= EPS:
+            return torch.full_like(weights, 1.0 / self.n_tasks)
+        return weights / denom
+
+    def _update_filtered_grads(self, task_grads: torch.Tensor) -> torch.Tensor:
+        if self.prev_grads is None:
+            corrected_grads = task_grads
+        else:
+            coeff = self.beta / max(1.0 - self.beta, EPS)
+            corrected_grads = task_grads + coeff * (task_grads - self.prev_grads)
+
+        if self.momentum_grads is None:
+            self.momentum_grads = torch.zeros_like(corrected_grads)
+
+        self.momentum_grads = (
+            self.beta * self.momentum_grads + (1.0 - self.beta) * corrected_grads
+        )
+        self.prev_grads = task_grads.detach().clone()
+        return self.momentum_grads
+
+    def _solve_mgda_weights(self, task_grads: torch.Tensor) -> torch.Tensor:
+        if self.n_tasks == 1:
+            return torch.ones(1, device=self.device)
+
+        if task_grads.numel() == 0 or torch.norm(task_grads) <= EPS:
+            return torch.full(
+                (self.n_tasks,),
+                1.0 / self.n_tasks,
+                device=self.device,
+                dtype=torch.float32,
+            )
+
+        try:
+            solver_inputs = [
+                [task_grads[:, task_idx].detach()]
+                for task_idx in range(self.n_tasks)
+            ]
+            solution, _ = self.solver.find_min_norm_element(solver_inputs)
+            weights = torch.from_numpy(solution.astype(np.float32)).to(self.device)
+        except Exception:
+            weights = torch.full(
+                (self.n_tasks,),
+                1.0 / self.n_tasks,
+                device=self.device,
+                dtype=torch.float32,
+            )
+
+        return self._normalize_weights(weights)
+
+    @staticmethod
+    def _assign_grad_vector(
+        parameters: List[torch.nn.parameter.Parameter], grad_vector: torch.Tensor
+    ):
+        offset = 0
+        for parameter in parameters:
+            numel = parameter.numel()
+            parameter.grad = grad_vector[offset : offset + numel].view_as(parameter).clone()
+            offset += numel
+
+    def get_weighted_loss(
+        self,
+        losses,
+        shared_parameters,
+        **kwargs,
+    ):
+        shared_parameters = self._to_parameter_list(shared_parameters)
+        if not shared_parameters:
+            weighted_loss = losses.mean()
+            return weighted_loss, {
+                "weights": self.weights.detach().clone(),
+                "updated_weights": False,
+            }
+
+        task_grads = self._collect_shared_task_grads(losses, shared_parameters)
+        filtered_grads = self._update_filtered_grads(task_grads)
+
+        updated_weights = (self.step % self.update_weights_every) == 0
+        if updated_weights:
+            candidate_weights = self._solve_mgda_weights(filtered_grads)
+            if self.step == 0:
+                self.weights = candidate_weights
+            else:
+                self.weights = self._normalize_weights(
+                    self.weight_smoothing * self.weights
+                    + (1.0 - self.weight_smoothing) * candidate_weights
+                )
+
+        self._latest_shared_grad = filtered_grads @ self.weights.detach()
+        self.step += 1
+
+        weighted_loss = torch.sum(losses * self.weights.detach())
+        extra_outputs = {
+            "weights": self.weights.detach().clone(),
+            "updated_weights": updated_weights,
+            "raw_shared_grad_norms": task_grads.norm(dim=0).detach().cpu(),
+            "filtered_shared_grad_norms": filtered_grads.norm(dim=0).detach().cpu(),
+        }
+        return weighted_loss, extra_outputs
+
+    def backward(
+        self,
+        losses: torch.Tensor,
+        parameters: Union[List[torch.nn.parameter.Parameter], torch.Tensor] = None,
+        shared_parameters: Union[
+            List[torch.nn.parameter.Parameter], torch.Tensor
+        ] = None,
+        task_specific_parameters: Union[
+            List[torch.nn.parameter.Parameter], torch.Tensor
+        ] = None,
+        **kwargs,
+    ):
+        shared_parameters = self._to_parameter_list(shared_parameters)
+        weighted_loss, extra_outputs = self.get_weighted_loss(
+            losses=losses, shared_parameters=shared_parameters, **kwargs
+        )
+
+        weighted_loss.backward()
+
+        if shared_parameters and self._latest_shared_grad is not None:
+            self._assign_grad_vector(shared_parameters, self._latest_shared_grad)
+            if self.max_norm > 0:
+                torch.nn.utils.clip_grad_norm_(shared_parameters, self.max_norm)
+
+        return weighted_loss, extra_outputs
 
 
 class GradDrop(WeightMethod):
@@ -1007,6 +1230,8 @@ class LOG_CAGrad(WeightMethod):
         return GTG, w_cpu
 
     def cagrad(self, grads, alpha=0.5, rescale=1):
+        if minimize is None:
+            raise ImportError("scipy is required to use LOG_CAGrad.")
         GG = grads.t().mm(grads).cpu()  # [num_tasks, num_tasks]
         g0_norm = (GG.mean() + 1e-8).sqrt()  # norm of the average gradient
 
@@ -1349,4 +1574,6 @@ METHODS = dict(
     nashmtl=NashMTL,
     famo=FAMO,
     fairgrad=FairGrad,
+    vargrad_psmgd=VarGradPSMGD,
+    vagrad_psmgd=VarGradPSMGD,
 )

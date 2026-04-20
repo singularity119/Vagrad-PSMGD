@@ -6,4 +6,5 @@ from methods.weight_methods import (
     NashMTL,
     PCGrad,
     Uncertainty,
+    VarGradPSMGD,
 )

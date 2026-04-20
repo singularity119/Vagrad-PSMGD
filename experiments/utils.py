@@ -69,6 +69,25 @@ common_parser.add_argument(
 common_parser.add_argument("--c", type=float, default=0.4, help="c for CAGrad alg.")
 # fairgrad
 common_parser.add_argument("--alpha", type=float, default=1.0, help="alpha for FairGrad alg.")
+# vargrad + psmgd
+common_parser.add_argument(
+    "--vargrad-beta",
+    type=float,
+    default=0.9,
+    help="beta for VarGrad correction and momentum filtering.",
+)
+common_parser.add_argument(
+    "--psmgd-update-every",
+    type=int,
+    default=10,
+    help="recompute MGDA task weights every R optimization steps.",
+)
+common_parser.add_argument(
+    "--psmgd-smoothing",
+    type=float,
+    default=0.5,
+    help="temporal smoothing factor a for lambda^k = a lambda^(k-R) + (1-a) lambda_hat.",
+)
 # famo
 common_parser.add_argument("--gamma", type=float, default=0.01, help="gamma of famo")
 common_parser.add_argument("--use_log", action='store_true', help="whether use log for famo")
@@ -135,6 +154,18 @@ def extract_weight_method_parameters_from_args(args):
                       w_lr=args.method_params_lr,
                       max_norm=args.max_norm),
             fairgrad=dict(alpha=args.alpha, max_norm=args.max_norm),
+            vargrad_psmgd=dict(
+                beta=args.vargrad_beta,
+                update_weights_every=args.psmgd_update_every,
+                weight_smoothing=args.psmgd_smoothing,
+                max_norm=args.max_norm,
+            ),
+            vagrad_psmgd=dict(
+                beta=args.vargrad_beta,
+                update_weights_every=args.psmgd_update_every,
+                weight_smoothing=args.psmgd_smoothing,
+                max_norm=args.max_norm,
+            ),
         )
     )
     return weight_methods_parameters
