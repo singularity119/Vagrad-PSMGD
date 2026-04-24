@@ -48,6 +48,7 @@ common_parser.add_argument(
 )
 common_parser.add_argument("--gpu", type=int, default=0, help="gpu device ID")
 common_parser.add_argument("--seed", type=int, default=42, help="seed value")
+common_parser.add_argument("--save-dir", type=str, default="./save", help="path to save experiment stats")
 # NashMTL
 common_parser.add_argument(
     "--nashmtl-optim-niter", type=int, default=20, help="number of CCCP iterations"
@@ -220,6 +221,38 @@ def resolve_composable_config_from_args(args):
         scheduler=scheduler,
         use_momentum=args.use_momentum,
     )
+
+
+def build_experiment_output_stem(args):
+    if "famo" in args.method:
+        name = f"{args.method}_gamma{args.gamma}_wlr{args.method_params_lr}"
+        if getattr(args, "scale_y", False):
+            name += "_scale"
+        return f"{name}_sd{args.seed}"
+
+    if args.method in ["modular", "compositional"]:
+        config = resolve_composable_config_from_args(args)
+        if config["scheduler"] == "psmgd_periodic":
+            return (
+                f"{args.method}_{config['preprocessing']}_{config['solver']}"
+                f"_psmgd_beta{args.beta_v}_R{args.psmgd_R}_a{args.psmgd_alpha}"
+                f"_alpha{args.alpha}_sd{args.seed}"
+            )
+        return (
+            f"{args.method}_{config['preprocessing']}_{config['solver']}"
+            f"_{config['scheduler']}_mom{int(config['use_momentum'])}_sd{args.seed}"
+        )
+
+    if "fairgrad" in args.method:
+        name = f"{args.method}_alpha{args.alpha}"
+        if getattr(args, "scale_y", False):
+            name += "_scale"
+        return f"{name}_sd{args.seed}"
+
+    if "stl" in args.method:
+        return f"{args.method}_task{args.main_task}_sd{args.seed}"
+
+    return f"{args.method}_sd{args.seed}"
 
 
 def extract_weight_method_parameters_from_args(args):

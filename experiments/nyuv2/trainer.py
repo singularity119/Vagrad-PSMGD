@@ -13,10 +13,10 @@ from experiments.nyuv2.data import NYUv2
 from experiments.nyuv2.models import SegNet, SegNetMtan
 from experiments.nyuv2.utils import ConfMatrix, delta_fn, depth_error, normal_error
 from experiments.utils import (
+    build_experiment_output_stem,
     common_parser,
     extract_weight_method_parameters_from_args,
     get_device,
-    resolve_composable_config_from_args,
     set_logger,
     set_seed,
     str2bool,
@@ -294,26 +294,33 @@ def main(path, lr, bs, device):
             ]
 
 
-            if "famo" in args.method:
-                name = f"{args.method}_gamma{args.gamma}_sd{args.seed}"
-            elif args.method in ["modular", "compositional"]:
-                config = resolve_composable_config_from_args(args)
-                name = (
-                    f"{args.method}_{config['preprocessing']}_{config['solver']}"
-                    f"_{config['scheduler']}_mom{int(config['use_momentum'])}_sd{args.seed}"
-                )
-            elif "fairgrad" in args.method:
-                name = f"{args.method}_alpha{args.alpha}_sd{args.seed}"
-            else:
-                name = f"{args.method}_sd{args.seed}"
-
+            name = build_experiment_output_stem(args)
             torch.save({
                 "delta_m": deltas,
                 "keys": keys,
                 "avg_cost": avg_cost,
                 "losses": loss_list,
-            }, f"./save/{name}.stats")
-
+            }, os.path.join(args.save_dir, f"{name}.stats"))
+    # add metrics
+    print("Final Performance: ")
+    final_performance = [
+        np.mean(avg_cost[-10:, 12]),  # Test Semantic Loss
+        np.mean(avg_cost[-10:, 13]),  # Test Mean IoU
+        np.mean(avg_cost[-10:, 14]),  # Test Pixel Accuracy
+        np.mean(avg_cost[-10:, 15]),  # Test Depth Loss
+        np.mean(avg_cost[-10:, 16]),  # Test Absolute Error
+        np.mean(avg_cost[-10:, 17]),  # Test Relative Error
+        np.mean(avg_cost[-10:, 18]),  # Test Normal Loss
+        np.mean(avg_cost[-10:, 19]),  # Test Loss Mean
+        np.mean(avg_cost[-10:, 20]),  # Test Loss Med
+        np.mean(avg_cost[-10:, 21]),  # Test Loss <11.25
+        np.mean(avg_cost[-10:, 22]),  # Test Loss <22.5
+        np.mean(avg_cost[-10:, 23]),  # Test Loss <30
+        np.mean(deltas[-10:])         # Test Delta_m
+    ]
+    
+    print('TEST: {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f}'
+            .format(*final_performance))
 
 if __name__ == "__main__":
     parser = ArgumentParser("NYUv2", parents=[common_parser])
@@ -322,6 +329,7 @@ if __name__ == "__main__":
         lr=1e-4,
         n_epochs=200,
         batch_size=2,
+        save_dir="/root/autodl-tmp/exp_logs_save/modular/nyuv2/save",
     )
     parser.add_argument(
         "--model",

@@ -13,10 +13,10 @@ from experiments.cityscapes.data import Cityscapes
 from experiments.cityscapes.models import SegNet, SegNetMtan
 from experiments.cityscapes.utils import ConfMatrix, delta_fn, depth_error
 from experiments.utils import (
+    build_experiment_output_stem,
     common_parser,
     extract_weight_method_parameters_from_args,
     get_device,
-    resolve_composable_config_from_args,
     set_logger,
     set_seed,
     str2bool,
@@ -246,26 +246,26 @@ def main(path, lr, bs, device):
                 "Test Relative Error",
             ]
 
-            if "famo" in args.method:
-                name = f"{args.method}_gamma{args.gamma}_sd{args.seed}"
-            elif args.method in ["modular", "compositional"]:
-                config = resolve_composable_config_from_args(args)
-                name = (
-                    f"{args.method}_{config['preprocessing']}_{config['solver']}"
-                    f"_{config['scheduler']}_mom{int(config['use_momentum'])}_sd{args.seed}"
-                )
-            elif "fairgrad" in args.method:
-                name = f"{args.method}_alpha{args.alpha}_sd{args.seed}"
-            else:
-                name = f"{args.method}_sd{args.seed}"
-
+            name = build_experiment_output_stem(args)
             torch.save({
                 "delta_m": deltas,
                 "keys": keys,
                 "avg_cost": avg_cost,
                 "losses": loss_list,
-            }, f"./save/{name}.stats")
+            }, os.path.join(args.save_dir, f"{name}.stats"))
 
+    print("Final Performance: ")
+    print(
+        "TEST: {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f}".format(
+            np.mean(avg_cost[-10:, 6]),
+            np.mean(avg_cost[-10:, 7]),
+            np.mean(avg_cost[-10:, 8]),
+            np.mean(avg_cost[-10:, 9]),
+            np.mean(avg_cost[-10:, 10]),
+            np.mean(avg_cost[-10:, 11]),
+            np.mean(deltas[-10:]),
+        )
+    )
 
 if __name__ == "__main__":
     parser = ArgumentParser("Cityscapes", parents=[common_parser])
@@ -274,6 +274,7 @@ if __name__ == "__main__":
         lr=1e-4,
         n_epochs=200,
         batch_size=8,
+        save_dir="/root/autodl-tmp/exp_logs_save/modular/cityscapes/save",
     )
     parser.add_argument(
         "--model",

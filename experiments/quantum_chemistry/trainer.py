@@ -19,10 +19,10 @@ from experiments.quantum_chemistry.utils import (
 )
 from experiments.quantum_chemistry.utils import target_idx as targets
 from experiments.utils import (
+    build_experiment_output_stem,
     common_parser,
     extract_weight_method_parameters_from_args,
     get_device,
-    resolve_composable_config_from_args,
     set_logger,
     set_seed,
     str2bool,
@@ -218,35 +218,34 @@ def main(
             else val_delta
         )
 
-        if "famo" in args.method:
-            if args.scale_y:
-                name = f"{args.method}_gamma{args.gamma}_wlr{args.method_params_lr}_scale_sd{args.seed}"
-            else:
-                name = f"{args.method}_gamma{args.gamma}_wlr{args.method_params_lr}_sd{args.seed}"
-        elif args.method in ["modular", "compositional"]:
-            config = resolve_composable_config_from_args(args)
-            scale_suffix = "_scale" if args.scale_y else ""
-            name = (
-                f"{args.method}_{config['preprocessing']}_{config['solver']}"
-                f"_{config['scheduler']}_mom{int(config['use_momentum'])}"
-                f"{scale_suffix}_sd{args.seed}"
-            )
-        elif "fairgrad" in args.method:
-            if args.scale_y:
-                name = f"{args.method}_alpha{args.alpha}_scale_sd{args.seed}"
-            else:
-                name = f"{args.method}_alpha{args.alpha}_sd{args.seed}"
-        elif "stl" in args.method:
-            name = f"{args.method}_task{args.main_task}_sd{args.seed}"
-        else:
-            name = f"{args.method}_sd{args.seed}"
-
+        name = build_experiment_output_stem(args)
         torch.save({
             "avg_cost": avg_cost,
             "losses": loss_list,
             "delta_m": deltas,
-        }, f"./save/{name}.stats")
+        }, os.path.join(args.save_dir, f"{name}.stats"))
 
+    # add metrics
+    print("Final Performance: ")
+    final_performance = [
+        np.mean(avg_cost[-10:, 13]),  # Test Loss (Avg)
+        *np.mean(avg_cost[-10:, 14:25], axis=0),  # Test Task Losses (11 tasks)
+        np.mean(deltas[-10:])  # Test Delta_m
+    ]
+
+    print('TEST: {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f}'
+          .format(*final_performance))
+
+       # Final metrics report
+    print("\n" + "="*30)
+    print(f"Final Performance (Epoch {epoch}):")
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test Delta: {test_delta:.4f}")
+    print("-" * 30)
+    print("Best Performance (Based on Val):")
+    print(f"Best Test Loss: {best_test:.4f}")
+    print(f"Best Test Delta: {best_test_delta:.4f}")
+    print("="*30)
 
 if __name__ == "__main__":
     parser = ArgumentParser("QM9", parents=[common_parser])
@@ -256,6 +255,7 @@ if __name__ == "__main__":
         n_epochs=300,
         batch_size=120,
         method="nashmtl",
+        save_dir="/root/autodl-tmp/exp_logs_save/modular/quantum_chemistry/save",
     )
     parser.add_argument("--scale-y", default=False, type=str2bool)
     parser.add_argument("--wandb_project", type=str, default=None, help="Name of Weights & Biases Project.")

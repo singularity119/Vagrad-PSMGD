@@ -11,10 +11,10 @@ from torch.utils.data import DataLoader
 from experiments.celeba.data import CelebaDataset
 from experiments.celeba.models import Network
 from experiments.utils import (
+    build_experiment_output_stem,
     common_parser,
     extract_weight_method_parameters_from_args,
     get_device,
-    resolve_composable_config_from_args,
     set_logger,
     set_seed,
     str2bool,
@@ -83,11 +83,16 @@ def main(path, lr, bs, device):
     best_val_f1 = 0.0
     best_epoch = None
 
+    n_train_batches = len(train_loader)
+    n_val_batches = len(val_loader)
+    n_test_batches = len(test_loader)
+
     for epoch in range(epochs):
         # training
         model.train()
         t0 = time.time()
-        for x, y in train_loader:
+        print(f"[info] epoch {epoch + 1}/{epochs} | starting training", flush=True)
+        for batch_idx, (x, y) in enumerate(train_loader, start=1):
             x = x.to(device)
             y = [y_.to(device) for y_ in y]
             y_ = model(x)
@@ -105,18 +110,31 @@ def main(path, lr, bs, device):
                     y_ = model(x)
                     new_losses = torch.stack([loss_fn(y_task_pred, y_task) for (y_task_pred, y_task) in zip(y_, y)])
                     weight_method.method.update(new_losses.detach())
+            print(
+                f"[train] epoch {epoch + 1}/{epochs} "
+                f"batch {batch_idx}/{n_train_batches} "
+                f"mean_loss={losses.mean().item():.6f}",
+                flush=True,
+            )
         t1 = time.time()
 
         model.eval()
         # validation
         metric.reset()
+        print(f"[info] epoch {epoch + 1}/{epochs} | starting validation", flush=True)
         with torch.no_grad():
-            for x, y in val_loader:
+            for batch_idx, (x, y) in enumerate(val_loader, start=1):
                 x = x.to(device)
                 y = [y_.to(device) for y_ in y]
                 y_ = model(x)
                 losses = torch.stack([loss_fn(y_task_pred, y_task) for (y_task_pred, y_task) in zip(y_, y)])
                 metric.incr(y_, y)
+                print(
+                    f"[val] epoch {epoch + 1}/{epochs} "
+                    f"batch {batch_idx}/{n_val_batches} "
+                    f"mean_loss={losses.mean().item():.6f}",
+                    flush=True,
+                )
         val_f1 = metric.result()
         if val_f1.mean() > best_val_f1:
             best_val_f1 = val_f1.mean()
@@ -124,32 +142,37 @@ def main(path, lr, bs, device):
 
         # testing
         metric.reset()
+        print(f"[info] epoch {epoch + 1}/{epochs} | starting test", flush=True)
         with torch.no_grad():
-            for x, y in test_loader:
+            for batch_idx, (x, y) in enumerate(test_loader, start=1):
                 x = x.to(device)
                 y = [y_.to(device) for y_ in y]
                 y_ = model(x)
                 losses = torch.stack([loss_fn(y_task_pred, y_task) for (y_task_pred, y_task) in zip(y_, y)])
                 metric.incr(y_, y)
+                print(
+                    f"[test] epoch {epoch + 1}/{epochs} "
+                    f"batch {batch_idx}/{n_test_batches} "
+                    f"mean_loss={losses.mean().item():.6f}",
+                    flush=True,
+                )
         test_f1 = metric.result()
         metrics[epoch] = test_f1
 
         t2 = time.time()
-        print(f"[info] epoch {epoch+1} | train takes {(t1-t0)/60:.1f} min | test takes {(t2-t1)/60:.1f} min")
+        print(
+            f"[info] epoch {epoch+1} | train takes {(t1-t0)/60:.1f} min | test takes {(t2-t1)/60:.1f} min",
+            flush=True,
+        )
+        
         if "famo" in args.method:
             name = f"{args.method}_gamma{args.gamma}_sd{args.seed}"
-        elif args.method in ["modular", "compositional"]:
-            config = resolve_composable_config_from_args(args)
-            name = (
-                f"{args.method}_{config['preprocessing']}_{config['solver']}"
-                f"_{config['scheduler']}_mom{int(config['use_momentum'])}_sd{args.seed}"
-            )
         elif "fairgrad" in args.method:
             name = f"{args.method}_alpha{args.alpha}_sd{args.seed}"
         else:
             name = f"{args.method}_sd{args.seed}"
-
-        torch.save({"metric": metrics, "best_epoch": best_epoch}, f"./save/{name}.stats")
+        
+        torch.save({"metric": metrics, "best_epoch": best_epoch}, os.path.join(args.save_dir, f"{name}.stats"))
 
 
 if __name__ == "__main__":
@@ -159,6 +182,7 @@ if __name__ == "__main__":
         lr=3e-4,
         n_epochs=15,
         batch_size=256,
+        save_dir="/root/autodl-tmp/exp_logs_save/modular/celeba/save",
     )
     args = parser.parse_args()
 
