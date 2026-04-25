@@ -78,6 +78,7 @@ def main(
     targets: list = None,
     scale_target: bool = True,
     main_task: int = None,
+    batch_log_interval: int = 50,
 ):
     dim = 64
     model = Net(n_tasks=len(targets), num_features=11, dim=dim).to(device)
@@ -106,6 +107,7 @@ def main(
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=0
     )
+    num_train_batches = len(train_loader)
 
     weight_method = WeightMethods(
         method,
@@ -167,6 +169,18 @@ def main(
                     out_ = model(data, return_representation=False)
                     new_losses = F.mse_loss(out_, data.y, reduction="none").mean(0)
                     weight_method.method.update(new_losses.detach())
+
+            if batch_log_interval > 0 and (
+                j == 0
+                or (j + 1) % batch_log_interval == 0
+                or (j + 1) == num_train_batches
+            ):
+                print(
+                    f"epoch {epoch + 1}/{n_epochs} | "
+                    f"batch {j + 1}/{num_train_batches} | "
+                    f"lr={lr} | train loss {losses.mean().item():.6f}",
+                    flush=True,
+                )
 
         val_loss_dict = evaluate(model, val_loader, std=std, scale_target=scale_target)
         test_loss_dict = evaluate(
@@ -260,6 +274,7 @@ if __name__ == "__main__":
     parser.add_argument("--scale-y", default=False, type=str2bool)
     parser.add_argument("--wandb_project", type=str, default=None, help="Name of Weights & Biases Project.")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Name of Weights & Biases Entity.")
+    parser.add_argument("--batch-log-interval", default=50, type=int, help="Print train progress every N batches. Set <=0 to disable.")
     args = parser.parse_args()
 
     # set seed
@@ -283,6 +298,7 @@ if __name__ == "__main__":
         targets=targets,
         scale_target=args.scale_y,
         main_task=args.main_task,
+        batch_log_interval=args.batch_log_interval,
     )
 
     if wandb.run is not None:
