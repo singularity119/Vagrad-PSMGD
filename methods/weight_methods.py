@@ -1168,10 +1168,18 @@ class ComposableMTL(WeightMethod):
         raw_task_grads = self._collect_shared_task_grads(losses, shared_parameters)
         preprocessed_task_grads = self._apply_preprocessing(raw_task_grads)
         solver_task_grads = self._apply_momentum(preprocessed_task_grads)
-        candidate_weights = self._solve_candidate_weights(solver_task_grads)
-        task_weights, updated_weights = self._apply_scheduler(
-            candidate_weights
-        )
+        if (
+            self.scheduler_name == "psmgd_periodic"
+            and (self.step % self.psmgd_R) != 0
+        ):
+            candidate_weights = self.last_candidate_weights
+            task_weights = self.weights
+            updated_weights = False
+        else:
+            candidate_weights = self._solve_candidate_weights(solver_task_grads)
+            task_weights, updated_weights = self._apply_scheduler(
+                candidate_weights
+            )
         self._latest_shared_grad = self._merge_task_grads(
             solver_task_grads, task_weights
         )
