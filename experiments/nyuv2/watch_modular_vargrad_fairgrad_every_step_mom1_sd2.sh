@@ -7,14 +7,14 @@ LOG_ROOT=/root/autodl-tmp/exp_logs_save/modular/nyuv2/log
 SAVE_ROOT=/root/autodl-tmp/exp_logs_save/modular/nyuv2/save
 SEED="${SEED:-2}"
 MODEL="${MODEL:-mtan}"
-RUN_NAME="${RUN_NAME:-modular_vargrad_fairgrad_every_step_mom1_sd${SEED}}"
+RUN_NAME="${RUN_NAME:-modular_vargrad_fairgrad_alpha2.0_beta0.85_every_step_sd${SEED}}"
 TRAIN_LOG="$LOG_ROOT/$RUN_NAME.log"
 STATS_FILE="$SAVE_ROOT/$RUN_NAME.stats"
 WATCH_LOG="$LOG_ROOT/$RUN_NAME.watchdog.log"
 CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
 STALE_SECONDS="${STALE_SECONDS:-1200}"
 
-MATCH_PATTERN="python -u trainer.py --method modular --preprocessing vargrad --solver fairgrad --scheduler every_step --use-momentum true --beta-v 0.9 --beta-m 0.9 --psmgd-R 10 --psmgd-alpha 0.5 --alpha 1.0 --seed ${SEED}"
+MATCH_PATTERN="python -u trainer.py --method modular --preprocessing vargrad --solver fairgrad --scheduler every_step --beta 0.85 --psmgd-R 10 --psmgd-alpha 0.5 --alpha 2.0 --seed ${SEED}"
 
 timestamp() {
   date '+%Y-%m-%d %H:%M:%S'
@@ -47,14 +47,13 @@ backup_artifacts() {
 
 start_run() {
   log "starting run via run_modular_vargrad_fairgrad_psmgd.sh"
-  (
-    cd "$RUN_DIR"
-    export SCHEDULER=every_step
-    export USE_MOMENTUM=true
-    export SEED
-    export MODEL
-    exec bash ./run_modular_vargrad_fairgrad_psmgd.sh
-  ) >> "$WATCH_LOG" 2>&1
+	(
+	  cd "$RUN_DIR"
+	  export SCHEDULER=every_step
+	  export SEED
+	  export MODEL
+	  exec bash ./run_modular_vargrad_fairgrad_psmgd.sh
+	) >> "$WATCH_LOG" 2>&1
 }
 
 log "watchdog started: run_name=${RUN_NAME} seed=${SEED} check_interval=${CHECK_INTERVAL}s stale_seconds=${STALE_SECONDS}s"

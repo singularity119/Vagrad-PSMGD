@@ -885,6 +885,57 @@ class FairGrad(WeightMethod):
         return None, {"GTG": GTG, "weights": w}  # NOTE: to align with all other weight methods
 
 
+def Vargrad(
+    grads,
+    last_grads=None,
+    exp_avg=None,
+    step=1,
+    beta=0.85,
+    gamma=1.0,
+    eps=1e-8,
+):
+    """
+    Vargrad: Variational gradient update for multi-task learning.
+
+    Args:
+        grads: Gradient matrix [grad_dim, n_tasks]
+        last_grads: Previous gradients
+        exp_avg: Exponential moving average of gradients
+        step: Current step
+        beta: First moment coefficient
+        gamma: Gradient momentum coefficient
+        eps: Small constant for numerical stability
+
+    Returns:
+        Updated gradients and momentum states
+    """
+    n_tasks = grads.shape[1]
+
+    if last_grads is None:
+        last_grads = torch.zeros_like(grads)
+    if exp_avg is None:
+        exp_avg = torch.zeros_like(grads)
+
+    update = torch.zeros_like(grads)
+
+    for task_idx in range(n_tasks):
+        task_grad = grads[:, task_idx]
+        task_last_grad = last_grads[:, task_idx]
+        task_exp_avg = exp_avg[:, task_idx]
+
+        c_t = task_grad + gamma * (beta / (1 - beta)) * (
+            task_grad - task_last_grad
+        )
+
+        task_update = beta * task_exp_avg + (1 - beta) * c_t
+
+        update[:, task_idx] = task_update
+        exp_avg[:, task_idx] = task_update
+        last_grads[:, task_idx] = task_grad.clone()
+
+    return update, last_grads, exp_avg
+
+
 class ComposableMTL(WeightMethod):
     """Composable preprocessing + solver + scheduler MTL framework."""
 
@@ -895,9 +946,7 @@ class ComposableMTL(WeightMethod):
         preprocessing="identity",
         solver="fairgrad",
         scheduler="every_step",
-        use_momentum=True,
-        beta_v=0.9,
-        beta_m=0.9,
+        beta=0.85,
         psmgd_R=10,
         psmgd_alpha=0.5,
         alpha=1.0,
@@ -912,10 +961,8 @@ class ComposableMTL(WeightMethod):
             raise ValueError(f"unknown solver {solver}.")
         if scheduler not in ["every_step", "psmgd_periodic"]:
             raise ValueError(f"unknown scheduler {scheduler}.")
-        if not 0.0 <= beta_v < 1.0:
-            raise ValueError("beta_v must satisfy 0 <= beta_v < 1.")
-        if not 0.0 <= beta_m < 1.0:
-            raise ValueError("beta_m must satisfy 0 <= beta_m < 1.")
+        if not 0.0 <= beta < 1.0:
+            raise ValueError("beta must satisfy 0 <= beta < 1.")
         if psmgd_R < 1:
             raise ValueError("psmgd_R must be >= 1.")
         if not 0.0 <= psmgd_alpha <= 1.0:
@@ -924,24 +971,19 @@ class ComposableMTL(WeightMethod):
         self.preprocessing = preprocessing
         self.solver_name = solver
         self.scheduler_name = scheduler
-        self.use_momentum = use_momentum
-        self.beta_v = beta_v
-        self.beta_m = beta_m
+        self.beta = beta
+        self.gamma = 1.0
+        self.eps = EPS
         self.psmgd_R = psmgd_R
         self.psmgd_alpha = psmgd_alpha
         self.fairgrad_alpha = alpha
         self.cagrad_c = c
         self.max_norm = max_norm
 
-        self.step = 0
-        self.prev_task_grads = None
-        self.task_momentum = None
-        self.weights = torch.full(
-            (n_tasks,),
-            1.0 / max(n_tasks, 1),
-            device=device,
-            dtype=torch.float32,
-        )
+        self.step = 1
+        self.last_grads = None
+        self.exp_avg = None
+        self.weights = self._default_weights()
         self.last_candidate_weights = self.weights.clone()
         self._latest_shared_grad = None
 
@@ -1018,33 +1060,42 @@ class ComposableMTL(WeightMethod):
             return torch.full_like(weights, 1.0 / self.n_tasks)
         return weights / denom
 
+    def _default_weights(self) -> torch.Tensor:
+        value = (
+            1.0 if self.solver_name == "fairgrad" else 1.0 / max(self.n_tasks, 1)
+        )
+        return torch.full(
+            (self.n_tasks,),
+            value,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+    def _prepare_solver_weights(self, weights: torch.Tensor) -> torch.Tensor:
+        if self.solver_name == "fairgrad":
+            weights = weights.clamp_min(0.0)
+            if weights.sum() <= EPS:
+                return self._default_weights()
+            return weights
+        return self._normalize_weights(weights)
+
+    def _scheduler_step(self) -> int:
+        return self.step - 1
+
     def _apply_preprocessing(self, raw_task_grads: torch.Tensor) -> torch.Tensor:
         if self.preprocessing != "vargrad":
-            corrected_grads = raw_task_grads
-        elif self.prev_task_grads is None:
-            corrected_grads = raw_task_grads
-        else:
-            coeff = self.beta_v / max(1.0 - self.beta_v, EPS)
-            corrected_grads = raw_task_grads + coeff * (
-                raw_task_grads - self.prev_task_grads
-            )
+            return raw_task_grads
 
-        self.prev_task_grads = raw_task_grads.detach().clone()
-        return corrected_grads
-
-    def _apply_momentum(self, processed_task_grads: torch.Tensor) -> torch.Tensor:
-        if not self.use_momentum:
-            self.task_momentum = processed_task_grads.detach().clone()
-            return processed_task_grads
-
-        if self.task_momentum is None:
-            self.task_momentum = torch.zeros_like(processed_task_grads)
-
-        self.task_momentum = (
-            self.beta_m * self.task_momentum
-            + (1.0 - self.beta_m) * processed_task_grads
+        raw_task_grads, self.last_grads, self.exp_avg = Vargrad(
+            raw_task_grads,
+            last_grads=self.last_grads,
+            exp_avg=self.exp_avg,
+            step=self.step,
+            beta=self.beta,
+            gamma=self.gamma,
+            eps=self.eps,
         )
-        return self.task_momentum
+        return raw_task_grads
 
     def _solve_candidate_weights(self, task_grads: torch.Tensor) -> torch.Tensor:
         if self.solver_name == "uniform":
@@ -1059,12 +1110,7 @@ class ComposableMTL(WeightMethod):
             return torch.ones(1, device=self.device)
 
         if task_grads.numel() == 0 or torch.norm(task_grads) <= EPS:
-            return torch.full(
-                (self.n_tasks,),
-                1.0 / self.n_tasks,
-                device=self.device,
-                dtype=torch.float32,
-            )
+            return self._default_weights()
 
         try:
             if self.solver_name == "fairgrad":
@@ -1102,43 +1148,40 @@ class ComposableMTL(WeightMethod):
             else:
                 raise ValueError(f"unsupported solver {self.solver_name}.")
         except Exception:
-            weights = torch.full(
-                (self.n_tasks,),
-                1.0 / self.n_tasks,
-                device=self.device,
-                dtype=torch.float32,
-            )
+            weights = self._default_weights()
 
-        return self._normalize_weights(weights)
+        return self._prepare_solver_weights(weights)
 
     def _apply_scheduler(
         self, candidate_weights: torch.Tensor
     ) -> Tuple[torch.Tensor, bool]:
-        candidate_weights = self._normalize_weights(candidate_weights)
+        candidate_weights = self._prepare_solver_weights(candidate_weights)
         self.last_candidate_weights = candidate_weights
 
         if self.scheduler_name == "every_step":
             self.weights = candidate_weights
             return self.weights, True
 
-        updated_weights = (self.step % self.psmgd_R) == 0
+        updated_weights = (self._scheduler_step() % self.psmgd_R) == 0
         if not updated_weights:
             return self.weights, False
 
-        if self.step == 0:
+        if self._scheduler_step() == 0:
             self.weights = candidate_weights
         else:
-            self.weights = self._normalize_weights(
+            self.weights = self._prepare_solver_weights(
                 self.psmgd_alpha * self.weights
                 + (1.0 - self.psmgd_alpha) * candidate_weights
             )
         return self.weights, True
 
-    @staticmethod
     def _merge_task_grads(
-        task_grads: torch.Tensor, task_weights: torch.Tensor
+        self, task_grads: torch.Tensor, task_weights: torch.Tensor
     ) -> torch.Tensor:
-        return (task_grads * task_weights.detach().view(1, -1)).sum(dim=1)
+        merged_grad = (task_grads * task_weights.detach().view(1, -1)).sum(dim=1)
+        if self.solver_name == "fairgrad":
+            merged_grad = merged_grad * self.n_tasks
+        return merged_grad
 
     @staticmethod
     def _assign_grad_vector(
@@ -1167,10 +1210,10 @@ class ComposableMTL(WeightMethod):
 
         raw_task_grads = self._collect_shared_task_grads(losses, shared_parameters)
         preprocessed_task_grads = self._apply_preprocessing(raw_task_grads)
-        solver_task_grads = self._apply_momentum(preprocessed_task_grads)
+        solver_task_grads = preprocessed_task_grads
         if (
             self.scheduler_name == "psmgd_periodic"
-            and (self.step % self.psmgd_R) != 0
+            and (self._scheduler_step() % self.psmgd_R) != 0
         ):
             candidate_weights = self.last_candidate_weights
             task_weights = self.weights
@@ -1220,7 +1263,10 @@ class ComposableMTL(WeightMethod):
             losses=losses, shared_parameters=shared_parameters, **kwargs
         )
 
-        weighted_loss.backward()
+        backward_loss = (
+            torch.sum(losses) if self.solver_name == "fairgrad" else weighted_loss
+        )
+        backward_loss.backward()
 
         if shared_parameters and self._latest_shared_grad is not None:
             self._assign_grad_vector(shared_parameters, self._latest_shared_grad)
@@ -1237,7 +1283,7 @@ class VarGradPSMGD(ComposableMTL):
         self,
         n_tasks,
         device: torch.device,
-        beta=0.9,
+        beta=0.85,
         update_weights_every=10,
         weight_smoothing=0.5,
         max_norm=1.0,
@@ -1248,9 +1294,7 @@ class VarGradPSMGD(ComposableMTL):
             preprocessing="vargrad",
             solver="mgda",
             scheduler="psmgd_periodic",
-            use_momentum=True,
-            beta_v=beta,
-            beta_m=beta,
+            beta=beta,
             psmgd_R=update_weights_every,
             psmgd_alpha=weight_smoothing,
             max_norm=max_norm,

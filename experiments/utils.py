@@ -99,28 +99,16 @@ common_parser.add_argument(
     help="optional override for preprocessing module",
 )
 common_parser.add_argument(
-    "--use-momentum",
-    type=str2bool,
-    default=True,
-    help="whether to apply momentum after preprocessing",
-)
-common_parser.add_argument(
     "--use-psmgd",
     type=str2bool,
     default=None,
     help="optional override for scheduler",
 )
 common_parser.add_argument(
-    "--beta-v",
+    "--beta",
     type=float,
-    default=0.9,
+    default=0.85,
     help="beta for VarGrad preprocessing",
-)
-common_parser.add_argument(
-    "--beta-m",
-    type=float,
-    default=0.9,
-    help="beta for momentum smoothing",
 )
 common_parser.add_argument(
     "--psmgd-R",
@@ -133,13 +121,6 @@ common_parser.add_argument(
     type=float,
     default=0.5,
     help="EMA smoothing coefficient for periodic weight refreshes",
-)
-# vargrad + psmgd
-common_parser.add_argument(
-    "--vargrad-beta",
-    type=float,
-    default=0.9,
-    help="beta for VarGrad correction and momentum filtering.",
 )
 common_parser.add_argument(
     "--psmgd-update-every",
@@ -219,7 +200,6 @@ def resolve_composable_config_from_args(args):
         preprocessing=preprocessing,
         solver=args.solver,
         scheduler=scheduler,
-        use_momentum=args.use_momentum,
     )
 
 
@@ -235,12 +215,12 @@ def build_experiment_output_stem(args):
         if config["scheduler"] == "psmgd_periodic":
             return (
                 f"{args.method}_{config['preprocessing']}_{config['solver']}"
-                f"_psmgd_beta{args.beta_v}_R{args.psmgd_R}_a{args.psmgd_alpha}"
-                f"_alpha{args.alpha}_sd{args.seed}"
+                f"_alpha{args.alpha}_beta{args.beta}"
+                f"_psmgd_R{args.psmgd_R}_a{args.psmgd_alpha}_sd{args.seed}"
             )
         return (
             f"{args.method}_{config['preprocessing']}_{config['solver']}"
-            f"_{config['scheduler']}_mom{int(config['use_momentum'])}_sd{args.seed}"
+            f"_alpha{args.alpha}_beta{args.beta}_{config['scheduler']}_sd{args.seed}"
         )
 
     if "fairgrad" in args.method:
@@ -278,9 +258,7 @@ def extract_weight_method_parameters_from_args(args):
                 preprocessing=composable_config["preprocessing"],
                 solver=composable_config["solver"],
                 scheduler=composable_config["scheduler"],
-                use_momentum=composable_config["use_momentum"],
-                beta_v=args.beta_v,
-                beta_m=args.beta_m,
+                beta=args.beta,
                 psmgd_R=args.psmgd_R,
                 psmgd_alpha=args.psmgd_alpha,
                 alpha=args.alpha,
@@ -292,9 +270,7 @@ def extract_weight_method_parameters_from_args(args):
                 preprocessing=composable_config["preprocessing"],
                 solver=composable_config["solver"],
                 scheduler=composable_config["scheduler"],
-                use_momentum=composable_config["use_momentum"],
-                beta_v=args.beta_v,
-                beta_m=args.beta_m,
+                beta=args.beta,
                 psmgd_R=args.psmgd_R,
                 psmgd_alpha=args.psmgd_alpha,
                 alpha=args.alpha,
@@ -303,13 +279,13 @@ def extract_weight_method_parameters_from_args(args):
                 max_norm=args.max_norm,
             ),
             vargrad_psmgd=dict(
-                beta=args.vargrad_beta,
+                beta=args.beta,
                 update_weights_every=args.psmgd_update_every,
                 weight_smoothing=args.psmgd_smoothing,
                 max_norm=args.max_norm,
             ),
             vagrad_psmgd=dict(
-                beta=args.vargrad_beta,
+                beta=args.beta,
                 update_weights_every=args.psmgd_update_every,
                 weight_smoothing=args.psmgd_smoothing,
                 max_norm=args.max_norm,

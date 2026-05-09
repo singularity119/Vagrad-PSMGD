@@ -11,15 +11,15 @@ TARGET_SEED="${TARGET_SEED:-0}"
 MODEL="${MODEL:-mtan}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
 
-SOURCE_RUN_NAME="modular_vargrad_fairgrad_every_step_mom1_sd${SOURCE_SEED}"
-TARGET_RUN_NAME="modular_vargrad_fairgrad_every_step_mom1_sd${TARGET_SEED}"
+SOURCE_RUN_NAME="modular_vargrad_fairgrad_alpha2.0_beta0.85_every_step_sd${SOURCE_SEED}"
+TARGET_RUN_NAME="modular_vargrad_fairgrad_alpha2.0_beta0.85_every_step_sd${TARGET_SEED}"
 SOURCE_LOG="$LOG_ROOT/$SOURCE_RUN_NAME.log"
 TARGET_LOG="$LOG_ROOT/$TARGET_RUN_NAME.log"
 TARGET_STATS="$SAVE_ROOT/$TARGET_RUN_NAME.stats"
 WATCH_LOG="$LOG_ROOT/$TARGET_RUN_NAME.after_sd${SOURCE_SEED}.watchdog.log"
 
-SOURCE_PATTERN="python -u trainer.py --method modular --preprocessing vargrad --solver fairgrad --scheduler every_step --use-momentum true --beta-v 0.9 --beta-m 0.9 --psmgd-R 10 --psmgd-alpha 0.5 --alpha 1.0 --seed ${SOURCE_SEED}"
-TARGET_PATTERN="python -u trainer.py --method modular --preprocessing vargrad --solver fairgrad --scheduler every_step --use-momentum true --beta-v 0.9 --beta-m 0.9 --psmgd-R 10 --psmgd-alpha 0.5 --alpha 1.0 --seed ${TARGET_SEED}"
+SOURCE_PATTERN="python -u trainer.py --method modular --preprocessing vargrad --solver fairgrad --scheduler every_step --beta 0.85 --psmgd-R 10 --psmgd-alpha 0.5 --alpha 2.0 --seed ${SOURCE_SEED}"
+TARGET_PATTERN="python -u trainer.py --method modular --preprocessing vargrad --solver fairgrad --scheduler every_step --beta 0.85 --psmgd-R 10 --psmgd-alpha 0.5 --alpha 2.0 --seed ${TARGET_SEED}"
 
 timestamp() {
   date '+%Y-%m-%d %H:%M:%S'
@@ -58,14 +58,13 @@ backup_target_artifacts() {
 
 start_target() {
   log "starting target run: seed=${TARGET_SEED} run_name=${TARGET_RUN_NAME}"
-  (
-    cd "$RUN_DIR"
-    export SCHEDULER=every_step
-    export USE_MOMENTUM=true
-    export SEED="$TARGET_SEED"
-    export MODEL
-    exec bash ./run_modular_vargrad_fairgrad_psmgd.sh
-  ) >> "$WATCH_LOG" 2>&1
+	(
+	  cd "$RUN_DIR"
+	  export SCHEDULER=every_step
+	  export SEED="$TARGET_SEED"
+	  export MODEL
+	  exec bash ./run_modular_vargrad_fairgrad_psmgd.sh
+	) >> "$WATCH_LOG" 2>&1
 }
 
 log "chain watcher started: source=${SOURCE_RUN_NAME} target=${TARGET_RUN_NAME} check_interval=${CHECK_INTERVAL}s"

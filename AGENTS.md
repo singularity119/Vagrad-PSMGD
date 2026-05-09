@@ -60,32 +60,27 @@ $$
 如果启用：
 
 $$
-c_t^k = g_t^k + \frac{\beta_v}{1 - \beta_v}\left(g_t^k - g_{t-1}^k\right)
+c_t^k = g_t^k + \gamma \frac{\beta}{1 - \beta}\left(g_t^k - g_{t-1}^k\right)
 $$
+
+并用师兄 VarGrad 的状态递推：
+
+$$
+u_t^k = \beta u_{t-1}^k + (1 - \beta)c_t^k
+$$
+
+其中默认 `gamma=1.0`，`last_grads` 和 `exp_avg` 初始为 `None`，第一次调用时按零张量初始化。第一步输出满足 `u_1^k = g_1^k`。
 
 否则：
 
 $$
-c_t^k = g_t^k
+u_t^k = g_t^k
 $$
 
-## Momentum
-
-如果启用：
-
-$$
-m_t^k = \beta_m m_{t-1}^k + (1 - \beta_m) c_t^k
-$$
-
-否则：
-
-$$
-m_t^k = c_t^k
-$$
 
 ## Solver
 
-solver 输入默认使用 `m_t^k`。
+solver 输入默认使用 `u_t^k`。
 
 solver 输出候选权重：
 
@@ -96,6 +91,7 @@ $$
 要求：
 
 - `fairgrad` 必须沿用原始 FairGrad 项目的定义
+- `fairgrad` 输出的 `w_cpu` 不做和为 1 的归一化
 - 不要重新定义 FairGrad 数学公式
 - `uniform` 使用均匀权重
 - `mgda/cagrad/nashmtl` 尽量复用原项目实现
@@ -121,12 +117,18 @@ $$
   \lambda_t = \lambda_{t-1}
   $$
 
-最后始终归一化 `lambda_t`。
+除 `fairgrad` 外，最后始终归一化 `lambda_t`。`fairgrad` 为了对齐原项目，PSMGD 平滑后也保留原始非归一化权重尺度。
 
 ## Update
 
 $$
-g_t^{\mathrm{agg}} = \sum_k \lambda_t^k m_t^k
+g_t^{\mathrm{agg}} = \sum_k \lambda_t^k u_t^k
+$$
+
+其中 `fairgrad` 需要对齐原项目的 `overwrite_grad` 行为：
+
+$$
+g_t^{\mathrm{agg}} = K \sum_k \lambda_t^k u_t^k
 $$
 
 用 `g_t^agg` 更新共享参数。
@@ -140,7 +142,7 @@ $$
 ## preprocessing
 只负责：
 - `g -> c`
-- `c -> m`
+- `c -> u`
 
 ## solver
 只负责：
@@ -169,6 +171,12 @@ $$
 - scheduler = every_step
 
 时，行为应尽量接近原始 FairGrad。
+
+具体要求：
+
+- FairGrad 权重保持原始 `w_cpu` 尺度，不归一化为和为 1
+- shared gradient 写回前乘任务数 `n_tasks`
+- task-specific head 使用未加权的 `sum(losses)` 反传，shared gradient 随后由 FairGrad 聚合梯度覆盖
 
 ## Baseline fallback
 
@@ -234,13 +242,11 @@ $$
 - `solver`
 - `scheduler`
 - `use_vargrad`
-- `use_momentum`
 - `use_psmgd`
 
 以及这些超参数：
 
-- `beta_v`
-- `beta_m`
+- `beta`
 - `psmgd_R`
 - `psmgd_alpha`
 
