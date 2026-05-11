@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import random
 from collections import defaultdict
@@ -30,6 +31,61 @@ def str2bool(v):
         return False
     else:
         raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
+def _format_weight_vector(value):
+    if value is None:
+        return "[]"
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (float, int)):
+        value = [value]
+    return "[" + ",".join(f"{float(item):.6f}" for item in value) + "]"
+
+
+def log_solver_update_event(
+    extra_outputs,
+    epoch,
+    batch_idx,
+    global_step,
+    enabled=True,
+):
+    if not enabled or not extra_outputs:
+        return
+    if not (
+        bool(extra_outputs.get("solver_called", False))
+        and bool(extra_outputs.get("updated_weights", False))
+    ):
+        return
+
+    logging.info(
+        "[solver_update] global_step=%s scheduler_step=%s epoch=%s batch=%s "
+        "preprocessing=%s solver=%s scheduler=%s weights=%s candidate_weights=%s",
+        global_step,
+        extra_outputs.get("scheduler_step", global_step),
+        epoch,
+        batch_idx,
+        extra_outputs.get("preprocessing", "unknown"),
+        extra_outputs.get("solver", "unknown"),
+        extra_outputs.get("scheduler", "unknown"),
+        _format_weight_vector(extra_outputs.get("weights")),
+        _format_weight_vector(extra_outputs.get("candidate_weights")),
+    )
+
+
+def write_u_telemetry_event(file_obj, extra_outputs, global_step):
+    if file_obj is None or not extra_outputs:
+        return
+
+    telemetry = extra_outputs.get("u_telemetry")
+    if not telemetry:
+        return
+
+    event = {"global_step": int(global_step)}
+    event.update(telemetry)
+    file_obj.write(json.dumps(event, ensure_ascii=True, separators=(",", ":")) + "\n")
 
 
 common_parser = argparse.ArgumentParser(add_help=False)
@@ -133,6 +189,18 @@ common_parser.add_argument(
     type=float,
     default=0.5,
     help="temporal smoothing factor a for lambda^k = a lambda^(k-R) + (1-a) lambda_hat.",
+)
+common_parser.add_argument(
+    "--log-solver-updates",
+    type=str2bool,
+    default=True,
+    help="log steps where the solver is called and task weights are refreshed",
+)
+common_parser.add_argument(
+    "--save-u-telemetry",
+    type=str2bool,
+    default=False,
+    help="save lightweight U_t telemetry to a JSONL file",
 )
 # famo
 common_parser.add_argument("--gamma", type=float, default=0.01, help="gamma of famo")

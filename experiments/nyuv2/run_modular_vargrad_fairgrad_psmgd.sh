@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO_ROOT=/root/Vagrad_PSMGD_modular
+REPO_ROOT="${REPO_ROOT:-/root/Vargrad_PSMGD_modular}"
 DATA_ROOT=/root/autodl-tmp/dataset/nyuv2
 EXP_ROOT=/root/autodl-tmp/experiment/nyuv2_experiment
 SAVE_DIR=/root/autodl-tmp/exp_logs_save/modular/nyuv2/save
@@ -21,6 +21,8 @@ batch_size="${BATCH_SIZE:-2}"
 epochs="${EPOCHS:-200}"
 lr="${LR:-1e-4}"
 model="${MODEL:-mtan}"
+save_u_telemetry="${SAVE_U_TELEMETRY:-false}"
+python_bin="${PYTHON_BIN:-/root/miniconda3/bin/python}"
 
 mkdir -p "$SAVE_DIR"
 mkdir -p "$LOG_ROOT"
@@ -36,7 +38,7 @@ fi
 
 log_file="$LOG_ROOT/${run_name}.log"
 
-nohup python -u trainer.py \
+nohup "$python_bin" -u trainer.py \
   --method "$method" \
   --preprocessing "$preprocessing" \
   --solver "$solver" \
@@ -52,6 +54,7 @@ nohup python -u trainer.py \
   --model "$model" \
   --data-path "$DATA_ROOT" \
   --save-dir "$SAVE_DIR" \
+  --save-u-telemetry "$save_u_telemetry" \
   > "$log_file" 2>&1 < /dev/null &
 
 echo "Started NYUv2 run: $log_file"

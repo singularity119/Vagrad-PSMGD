@@ -23,6 +23,7 @@ from experiments.utils import (
     common_parser,
     extract_weight_method_parameters_from_args,
     get_device,
+    log_solver_update_event,
     set_logger,
     set_seed,
     str2bool,
@@ -79,6 +80,7 @@ def main(
     scale_target: bool = True,
     main_task: int = None,
     batch_log_interval: int = 50,
+    log_solver_updates: bool = True,
 ):
     dim = 64
     model = Net(n_tasks=len(targets), num_features=11, dim=dim).to(device)
@@ -159,6 +161,14 @@ def main(
                 task_specific_parameters=list(model.task_specific_parameters()),
                 last_shared_parameters=list(model.last_shared_parameters()),
                 representation=features,
+            )
+            custom_step = epoch * len(train_loader) + j
+            log_solver_update_event(
+                extra_outputs,
+                epoch=epoch,
+                batch_idx=j,
+                global_step=custom_step,
+                enabled=log_solver_updates,
             )
 
             loss_list.append(losses.detach().cpu())
@@ -299,6 +309,7 @@ if __name__ == "__main__":
         scale_target=args.scale_y,
         main_task=args.main_task,
         batch_log_interval=args.batch_log_interval,
+        log_solver_updates=args.log_solver_updates,
     )
 
     if wandb.run is not None:

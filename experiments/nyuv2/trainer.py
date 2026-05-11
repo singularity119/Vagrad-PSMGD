@@ -17,9 +17,11 @@ from experiments.utils import (
     common_parser,
     extract_weight_method_parameters_from_args,
     get_device,
+    log_solver_update_event,
     set_logger,
     set_seed,
     str2bool,
+    write_u_telemetry_event,
 )
 from methods.weight_methods import WeightMethods
 
@@ -106,6 +108,15 @@ def main(path, lr, bs, device):
 
     # some extra statistics we save during training
     loss_list = []
+    u_telemetry_file = None
+    if getattr(args, "save_u_telemetry", False):
+        os.makedirs(args.save_dir, exist_ok=True)
+        u_telemetry_name = build_experiment_output_stem(args)
+        u_telemetry_path = os.path.join(
+            args.save_dir, f"{u_telemetry_name}.u_telemetry.jsonl"
+        )
+        u_telemetry_file = open(u_telemetry_path, "w", buffering=1)
+        logging.info("Saving U_t telemetry to %s", u_telemetry_path)
 
     for epoch in epoch_iter:
         cost = np.zeros(24, dtype=np.float32)
@@ -137,6 +148,18 @@ def main(path, lr, bs, device):
                 task_specific_parameters=list(model.task_specific_parameters()),
                 last_shared_parameters=list(model.last_shared_parameters()),
                 representation=features,
+            )
+            log_solver_update_event(
+                extra_outputs,
+                epoch=epoch,
+                batch_idx=j,
+                global_step=custom_step,
+                enabled=getattr(args, "log_solver_updates", True),
+            )
+            write_u_telemetry_event(
+                u_telemetry_file,
+                extra_outputs,
+                global_step=custom_step,
             )
 
             # for record intermediate statistics
@@ -301,6 +324,8 @@ def main(path, lr, bs, device):
                 "avg_cost": avg_cost,
                 "losses": loss_list,
             }, os.path.join(args.save_dir, f"{name}.stats"))
+    if u_telemetry_file is not None:
+        u_telemetry_file.close()
     # add metrics
     print("Final Performance: ")
     final_performance = [

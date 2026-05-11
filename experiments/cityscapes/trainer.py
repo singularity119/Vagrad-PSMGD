@@ -17,6 +17,7 @@ from experiments.utils import (
     common_parser,
     extract_weight_method_parameters_from_args,
     get_device,
+    log_solver_update_event,
     set_logger,
     set_seed,
     str2bool,
@@ -130,6 +131,13 @@ def main(path, lr, bs, device):
                 task_specific_parameters=list(model.task_specific_parameters()),
                 last_shared_parameters=list(model.last_shared_parameters()),
                 representation=features,
+            )
+            log_solver_update_event(
+                extra_outputs,
+                epoch=epoch,
+                batch_idx=j,
+                global_step=custom_step,
+                enabled=getattr(args, "log_solver_updates", True),
             )
             loss_list.append(losses.detach().cpu())
             optimizer.step()

@@ -986,6 +986,9 @@ class ComposableMTL(WeightMethod):
         self.weights = self._default_weights()
         self.last_candidate_weights = self.weights.clone()
         self._latest_shared_grad = None
+        self.prev_solver_task_grads = None
+        self.last_refresh_task_grads = None
+        self.last_refresh_step = -1
 
         # Reuse original solver implementations whenever possible.
         self._mgda_solver = MinNormSolver()
@@ -1193,6 +1196,80 @@ class ComposableMTL(WeightMethod):
             parameter.grad = grad_vector[offset : offset + numel].view_as(parameter).clone()
             offset += numel
 
+    @staticmethod
+    def _float(value: torch.Tensor) -> float:
+        return float(value.detach().cpu().item())
+
+    @staticmethod
+    def _float_list(value: torch.Tensor) -> List[float]:
+        return [float(item) for item in value.detach().cpu().tolist()]
+
+    def _build_u_telemetry(
+        self,
+        solver_task_grads: torch.Tensor,
+        task_weights: torch.Tensor,
+        candidate_weights: torch.Tensor,
+        scheduler_step: int,
+        updated_weights: bool,
+    ) -> dict:
+        current = solver_task_grads.detach()
+        u_norm = torch.norm(current)
+        task_u_norms = current.norm(dim=0)
+
+        if self.prev_solver_task_grads is None:
+            step_diff = current.new_tensor(0.0)
+            prev_norm = current.new_tensor(1.0)
+            task_step_rel = torch.zeros_like(task_u_norms)
+        else:
+            step_delta = current - self.prev_solver_task_grads
+            step_diff = torch.norm(step_delta)
+            prev_norm = torch.norm(self.prev_solver_task_grads)
+            task_step_diff = step_delta.norm(dim=0)
+            prev_task_norms = self.prev_solver_task_grads.norm(dim=0)
+            task_step_rel = task_step_diff / (prev_task_norms + EPS)
+
+        step_rel = step_diff / (prev_norm + EPS)
+
+        if self.last_refresh_task_grads is None:
+            last_refresh_u_norm = current.new_tensor(0.0)
+            last_refresh_task_u_norms = torch.zeros_like(task_u_norms)
+            refresh_diff = current.new_tensor(0.0)
+            refresh_rel = current.new_tensor(0.0)
+        else:
+            refresh_delta = current - self.last_refresh_task_grads
+            refresh_diff = torch.norm(refresh_delta)
+            last_refresh_u_norm = torch.norm(self.last_refresh_task_grads)
+            last_refresh_task_u_norms = self.last_refresh_task_grads.norm(dim=0)
+            refresh_rel = refresh_diff / (last_refresh_u_norm + EPS)
+
+        task_u_norms_list = self._float_list(task_u_norms)
+        task_step_rel_list = self._float_list(task_step_rel)
+        last_refresh_task_u_norms_list = self._float_list(last_refresh_task_u_norms)
+        telemetry = {
+            "scheduler_step": int(scheduler_step),
+            "u_norm_fro": self._float(u_norm),
+            "step_diff_fro": self._float(step_diff),
+            "step_rel_fro": self._float(step_rel),
+            "task_u_norms": task_u_norms_list,
+            "task_step_rel": task_step_rel_list,
+            "step_max_task_rel": max(task_step_rel_list) if task_step_rel_list else 0.0,
+            "step_sum_task_rel": float(sum(task_step_rel_list)),
+            "last_refresh_step": int(self.last_refresh_step),
+            "last_refresh_u_norm_fro": self._float(last_refresh_u_norm),
+            "last_refresh_task_u_norms": last_refresh_task_u_norms_list,
+            "refresh_diff_fro": self._float(refresh_diff),
+            "refresh_rel_fro": self._float(refresh_rel),
+            "weights": self._float_list(task_weights),
+            "candidate_weights": self._float_list(candidate_weights),
+        }
+
+        self.prev_solver_task_grads = current.clone()
+        if updated_weights:
+            self.last_refresh_task_grads = current.clone()
+            self.last_refresh_step = scheduler_step
+
+        return telemetry
+
     def get_weighted_loss(
         self,
         losses,
@@ -1206,25 +1283,37 @@ class ComposableMTL(WeightMethod):
                 "weights": self.weights.detach().clone(),
                 "candidate_weights": self.last_candidate_weights.detach().clone(),
                 "updated_weights": False,
+                "solver_called": False,
+                "scheduler_step": self._scheduler_step(),
             }
 
         raw_task_grads = self._collect_shared_task_grads(losses, shared_parameters)
         preprocessed_task_grads = self._apply_preprocessing(raw_task_grads)
         solver_task_grads = preprocessed_task_grads
+        scheduler_step = self._scheduler_step()
+        solver_called = False
         if (
             self.scheduler_name == "psmgd_periodic"
-            and (self._scheduler_step() % self.psmgd_R) != 0
+            and (scheduler_step % self.psmgd_R) != 0
         ):
             candidate_weights = self.last_candidate_weights
             task_weights = self.weights
             updated_weights = False
         else:
+            solver_called = True
             candidate_weights = self._solve_candidate_weights(solver_task_grads)
             task_weights, updated_weights = self._apply_scheduler(
                 candidate_weights
             )
         self._latest_shared_grad = self._merge_task_grads(
             solver_task_grads, task_weights
+        )
+        u_telemetry = self._build_u_telemetry(
+            solver_task_grads=solver_task_grads,
+            task_weights=task_weights,
+            candidate_weights=self.last_candidate_weights,
+            scheduler_step=scheduler_step,
+            updated_weights=updated_weights,
         )
         self.step += 1
 
@@ -1233,6 +1322,9 @@ class ComposableMTL(WeightMethod):
             "weights": task_weights.detach().clone(),
             "candidate_weights": self.last_candidate_weights.detach().clone(),
             "updated_weights": updated_weights,
+            "solver_called": solver_called,
+            "scheduler_step": scheduler_step,
+            "u_telemetry": u_telemetry,
             "preprocessing": self.preprocessing,
             "solver": self.solver_name,
             "scheduler": self.scheduler_name,
