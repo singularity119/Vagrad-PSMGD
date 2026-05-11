@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO_ROOT=/root/Vagrad-PSMGD-modular
+REPO_ROOT=/root/Vagrad_PSMGD_modular
 DATA_ROOT=/root/autodl-tmp/dataset/nyuv2
 EXP_ROOT=/root/autodl-tmp/experiment/nyuv2_experiment
 SAVE_DIR=/root/autodl-tmp/exp_logs_save/modular/nyuv2/save
