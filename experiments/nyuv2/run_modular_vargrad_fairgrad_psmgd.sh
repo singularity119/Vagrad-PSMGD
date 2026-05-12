@@ -37,7 +37,7 @@ else
       psmgd_dynamic_threshold="1.1187902688980103"
       ;;
     step_rel_fro:above)
-      psmgd_dynamic_threshold="1.7600570917129517"
+      psmgd_dynamic_threshold="1.76"
       ;;
     *)
       echo "Unsupported PSMGD dynamic metric/direction: ${psmgd_dynamic_metric}/${psmgd_dynamic_direction}" >&2
