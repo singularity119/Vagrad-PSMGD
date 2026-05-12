@@ -15,6 +15,36 @@ scheduler="${SCHEDULER:-psmgd_periodic}"
 beta="${BETA:-0.85}"
 psmgd_R="${PSMGD_R:-10}"
 psmgd_alpha="${PSMGD_ALPHA:-0.5}"
+psmgd_dynamic_metric="${PSMGD_DYNAMIC_METRIC:-refresh_rel_fro}"
+if [[ -n "${PSMGD_DYNAMIC_DIRECTION:-}" ]]; then
+  psmgd_dynamic_direction="$PSMGD_DYNAMIC_DIRECTION"
+elif [[ "$psmgd_dynamic_metric" == "step_rel_fro" ]]; then
+  psmgd_dynamic_direction="above"
+else
+  psmgd_dynamic_direction="below"
+fi
+if [[ -n "${PSMGD_DYNAMIC_THRESHOLD:-}" ]]; then
+  psmgd_dynamic_threshold="$PSMGD_DYNAMIC_THRESHOLD"
+else
+  case "${psmgd_dynamic_metric}:${psmgd_dynamic_direction}" in
+    refresh_rel_fro:below)
+      psmgd_dynamic_threshold="1.0164316892623901"
+      ;;
+    refresh_rel_fro:above)
+      psmgd_dynamic_threshold="1.098314642906189"
+      ;;
+    step_rel_fro:below)
+      psmgd_dynamic_threshold="1.1187902688980103"
+      ;;
+    step_rel_fro:above)
+      psmgd_dynamic_threshold="1.7600570917129517"
+      ;;
+    *)
+      echo "Unsupported PSMGD dynamic metric/direction: ${psmgd_dynamic_metric}/${psmgd_dynamic_direction}" >&2
+      exit 1
+      ;;
+  esac
+fi
 alpha="${ALPHA:-2.0}"
 seed="${SEED:-0}"
 batch_size="${BATCH_SIZE:-2}"
@@ -32,6 +62,8 @@ export OMP_NUM_THREADS=8
 
 if [[ "$scheduler" == "psmgd_periodic" ]]; then
   run_name="${method}_${preprocessing}_beta${beta}_${solver}_alpha${alpha}_psmgd_R${psmgd_R}_a${psmgd_alpha}_sd${seed}"
+elif [[ "$scheduler" == "psmgd_dynamic" ]]; then
+  run_name="${method}_${preprocessing}_beta${beta}_${solver}_alpha${alpha}_psmgd_dynamic_${psmgd_dynamic_metric}_${psmgd_dynamic_direction}_thr${psmgd_dynamic_threshold}_a${psmgd_alpha}_sd${seed}"
 else
   run_name="${method}_${preprocessing}_beta${beta}_${solver}_alpha${alpha}_${scheduler}_sd${seed}"
 fi
@@ -46,6 +78,9 @@ nohup "$python_bin" -u trainer.py \
   --beta "$beta" \
   --psmgd-R "$psmgd_R" \
   --psmgd-alpha "$psmgd_alpha" \
+  --psmgd-dynamic-threshold "$psmgd_dynamic_threshold" \
+  --psmgd-dynamic-metric "$psmgd_dynamic_metric" \
+  --psmgd-dynamic-direction "$psmgd_dynamic_direction" \
   --alpha "$alpha" \
   --seed "$seed" \
   --batch-size "$batch_size" \

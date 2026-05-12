@@ -19,6 +19,20 @@ except ImportError:
 from methods.min_norm_solvers import MinNormSolver, gradient_normalizers
 
 EPS = 1e-8 # for numerical stability
+DYNAMIC_PSMGD_DEFAULT_DIRECTIONS = {
+    "refresh_rel_fro": "below",
+    "step_rel_fro": "above",
+}
+DYNAMIC_PSMGD_DEFAULT_THRESHOLDS = {
+    "refresh_rel_fro": {
+        "below": 1.0164316892623901,
+        "above": 1.098314642906189,
+    },
+    "step_rel_fro": {
+        "below": 1.1187902688980103,
+        "above": 1.7600570917129517,
+    },
+}
 
 
 class WeightMethod:
@@ -949,6 +963,9 @@ class ComposableMTL(WeightMethod):
         beta=0.85,
         psmgd_R=10,
         psmgd_alpha=0.5,
+        psmgd_dynamic_threshold=None,
+        psmgd_dynamic_metric="refresh_rel_fro",
+        psmgd_dynamic_direction=None,
         alpha=1.0,
         c=0.4,
         nashmtl_optim_niter=20,
@@ -959,7 +976,7 @@ class ComposableMTL(WeightMethod):
             raise ValueError(f"unknown preprocessing {preprocessing}.")
         if solver not in ["uniform", "fairgrad", "mgda", "cagrad", "nashmtl"]:
             raise ValueError(f"unknown solver {solver}.")
-        if scheduler not in ["every_step", "psmgd_periodic"]:
+        if scheduler not in ["every_step", "psmgd_periodic", "psmgd_dynamic"]:
             raise ValueError(f"unknown scheduler {scheduler}.")
         if not 0.0 <= beta < 1.0:
             raise ValueError("beta must satisfy 0 <= beta < 1.")
@@ -967,6 +984,22 @@ class ComposableMTL(WeightMethod):
             raise ValueError("psmgd_R must be >= 1.")
         if not 0.0 <= psmgd_alpha <= 1.0:
             raise ValueError("psmgd_alpha must satisfy 0 <= alpha <= 1.")
+        if psmgd_dynamic_metric not in ["refresh_rel_fro", "step_rel_fro"]:
+            raise ValueError(f"unknown psmgd_dynamic_metric {psmgd_dynamic_metric}.")
+        if psmgd_dynamic_direction is None:
+            psmgd_dynamic_direction = DYNAMIC_PSMGD_DEFAULT_DIRECTIONS[
+                psmgd_dynamic_metric
+            ]
+        if psmgd_dynamic_direction not in ["above", "below"]:
+            raise ValueError(
+                f"unknown psmgd_dynamic_direction {psmgd_dynamic_direction}."
+            )
+        if psmgd_dynamic_threshold is None:
+            psmgd_dynamic_threshold = DYNAMIC_PSMGD_DEFAULT_THRESHOLDS[
+                psmgd_dynamic_metric
+            ][psmgd_dynamic_direction]
+        if psmgd_dynamic_threshold < 0.0:
+            raise ValueError("psmgd_dynamic_threshold must be >= 0.")
 
         self.preprocessing = preprocessing
         self.solver_name = solver
@@ -976,6 +1009,9 @@ class ComposableMTL(WeightMethod):
         self.eps = EPS
         self.psmgd_R = psmgd_R
         self.psmgd_alpha = psmgd_alpha
+        self.psmgd_dynamic_threshold = psmgd_dynamic_threshold
+        self.psmgd_dynamic_metric = psmgd_dynamic_metric
+        self.psmgd_dynamic_direction = psmgd_dynamic_direction
         self.fairgrad_alpha = alpha
         self.cagrad_c = c
         self.max_norm = max_norm
@@ -1165,11 +1201,12 @@ class ComposableMTL(WeightMethod):
             self.weights = candidate_weights
             return self.weights, True
 
-        updated_weights = (self._scheduler_step() % self.psmgd_R) == 0
-        if not updated_weights:
-            return self.weights, False
+        if self.scheduler_name == "psmgd_periodic":
+            updated_weights = (self._scheduler_step() % self.psmgd_R) == 0
+            if not updated_weights:
+                return self.weights, False
 
-        if self._scheduler_step() == 0:
+        if self.last_refresh_step < 0:
             self.weights = candidate_weights
         else:
             self.weights = self._prepare_solver_weights(
@@ -1204,6 +1241,56 @@ class ComposableMTL(WeightMethod):
     def _float_list(value: torch.Tensor) -> List[float]:
         return [float(item) for item in value.detach().cpu().tolist()]
 
+    def _compute_step_rel_fro(self, solver_task_grads: torch.Tensor) -> float:
+        if self.prev_solver_task_grads is None:
+            return 0.0
+        current = solver_task_grads.detach()
+        step_delta = current - self.prev_solver_task_grads
+        step_diff = torch.norm(step_delta)
+        prev_norm = torch.norm(self.prev_solver_task_grads)
+        step_rel = step_diff / (prev_norm + EPS)
+        return self._float(step_rel)
+
+    def _compute_refresh_rel_fro(self, solver_task_grads: torch.Tensor) -> float:
+        if self.last_refresh_task_grads is None:
+            return 0.0
+        current = solver_task_grads.detach()
+        refresh_delta = current - self.last_refresh_task_grads
+        refresh_diff = torch.norm(refresh_delta)
+        last_refresh_u_norm = torch.norm(self.last_refresh_task_grads)
+        refresh_rel = refresh_diff / (last_refresh_u_norm + EPS)
+        return self._float(refresh_rel)
+
+    def _compute_dynamic_refresh_score(self, solver_task_grads: torch.Tensor) -> float:
+        if self.psmgd_dynamic_metric == "refresh_rel_fro":
+            return self._compute_refresh_rel_fro(solver_task_grads)
+        if self.psmgd_dynamic_metric == "step_rel_fro":
+            return self._compute_step_rel_fro(solver_task_grads)
+        raise ValueError(f"unknown psmgd_dynamic_metric {self.psmgd_dynamic_metric}.")
+
+    def _should_call_solver(
+        self, solver_task_grads: torch.Tensor, scheduler_step: int
+    ) -> Tuple[bool, bool, float]:
+        if self.scheduler_name == "every_step":
+            return True, False, 0.0
+
+        if self.scheduler_name == "psmgd_periodic":
+            return (scheduler_step % self.psmgd_R) == 0, False, 0.0
+
+        if self.last_refresh_task_grads is None:
+            return True, True, 0.0
+
+        dynamic_refresh_score = self._compute_dynamic_refresh_score(solver_task_grads)
+        if self.psmgd_dynamic_direction == "above":
+            dynamic_refresh_triggered = (
+                dynamic_refresh_score > self.psmgd_dynamic_threshold
+            )
+        else:
+            dynamic_refresh_triggered = (
+                dynamic_refresh_score <= self.psmgd_dynamic_threshold
+            )
+        return dynamic_refresh_triggered, dynamic_refresh_triggered, dynamic_refresh_score
+
     def _build_u_telemetry(
         self,
         solver_task_grads: torch.Tensor,
@@ -1211,6 +1298,9 @@ class ComposableMTL(WeightMethod):
         candidate_weights: torch.Tensor,
         scheduler_step: int,
         updated_weights: bool,
+        solver_called: bool,
+        dynamic_refresh_triggered: bool,
+        dynamic_refresh_score: float,
     ) -> dict:
         current = solver_task_grads.detach()
         u_norm = torch.norm(current)
@@ -1259,6 +1349,13 @@ class ComposableMTL(WeightMethod):
             "last_refresh_task_u_norms": last_refresh_task_u_norms_list,
             "refresh_diff_fro": self._float(refresh_diff),
             "refresh_rel_fro": self._float(refresh_rel),
+            "solver_called": bool(solver_called),
+            "updated_weights": bool(updated_weights),
+            "dynamic_refresh_metric": self.psmgd_dynamic_metric,
+            "dynamic_refresh_direction": self.psmgd_dynamic_direction,
+            "dynamic_refresh_score": float(dynamic_refresh_score),
+            "dynamic_refresh_threshold": float(self.psmgd_dynamic_threshold),
+            "dynamic_refresh_triggered": bool(dynamic_refresh_triggered),
             "weights": self._float_list(task_weights),
             "candidate_weights": self._float_list(candidate_weights),
         }
@@ -1285,22 +1382,30 @@ class ComposableMTL(WeightMethod):
                 "updated_weights": False,
                 "solver_called": False,
                 "scheduler_step": self._scheduler_step(),
+                "dynamic_refresh_metric": self.psmgd_dynamic_metric,
+                "dynamic_refresh_direction": self.psmgd_dynamic_direction,
+                "dynamic_refresh_score": 0.0,
+                "dynamic_refresh_threshold": float(self.psmgd_dynamic_threshold),
+                "dynamic_refresh_triggered": False,
             }
 
         raw_task_grads = self._collect_shared_task_grads(losses, shared_parameters)
         preprocessed_task_grads = self._apply_preprocessing(raw_task_grads)
         solver_task_grads = preprocessed_task_grads
         scheduler_step = self._scheduler_step()
-        solver_called = False
-        if (
-            self.scheduler_name == "psmgd_periodic"
-            and (scheduler_step % self.psmgd_R) != 0
-        ):
+        (
+            solver_called,
+            dynamic_refresh_triggered,
+            dynamic_refresh_score,
+        ) = self._should_call_solver(
+            solver_task_grads,
+            scheduler_step,
+        )
+        if not solver_called:
             candidate_weights = self.last_candidate_weights
             task_weights = self.weights
             updated_weights = False
         else:
-            solver_called = True
             candidate_weights = self._solve_candidate_weights(solver_task_grads)
             task_weights, updated_weights = self._apply_scheduler(
                 candidate_weights
@@ -1314,6 +1419,9 @@ class ComposableMTL(WeightMethod):
             candidate_weights=self.last_candidate_weights,
             scheduler_step=scheduler_step,
             updated_weights=updated_weights,
+            solver_called=solver_called,
+            dynamic_refresh_triggered=dynamic_refresh_triggered,
+            dynamic_refresh_score=dynamic_refresh_score,
         )
         self.step += 1
 
@@ -1324,6 +1432,11 @@ class ComposableMTL(WeightMethod):
             "updated_weights": updated_weights,
             "solver_called": solver_called,
             "scheduler_step": scheduler_step,
+            "dynamic_refresh_metric": self.psmgd_dynamic_metric,
+            "dynamic_refresh_direction": self.psmgd_dynamic_direction,
+            "dynamic_refresh_score": float(dynamic_refresh_score),
+            "dynamic_refresh_threshold": float(self.psmgd_dynamic_threshold),
+            "dynamic_refresh_triggered": dynamic_refresh_triggered,
             "u_telemetry": u_telemetry,
             "preprocessing": self.preprocessing,
             "solver": self.solver_name,

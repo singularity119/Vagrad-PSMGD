@@ -11,6 +11,22 @@ import torch
 from methods import METHODS
 
 
+DYNAMIC_PSMGD_DEFAULT_DIRECTIONS = {
+    "refresh_rel_fro": "below",
+    "step_rel_fro": "above",
+}
+DYNAMIC_PSMGD_DEFAULT_THRESHOLDS = {
+    "refresh_rel_fro": {
+        "below": 1.0164316892623901,
+        "above": 1.098314642906189,
+    },
+    "step_rel_fro": {
+        "below": 1.1187902688980103,
+        "above": 1.7600570917129517,
+    },
+}
+
+
 def str_to_list(string):
     return [float(s) for s in string.split(",")]
 
@@ -144,7 +160,7 @@ common_parser.add_argument(
 common_parser.add_argument(
     "--scheduler",
     type=str,
-    choices=["every_step", "psmgd_periodic"],
+    choices=["every_step", "psmgd_periodic", "psmgd_dynamic"],
     default="every_step",
     help="weight scheduling strategy",
 )
@@ -177,6 +193,26 @@ common_parser.add_argument(
     type=float,
     default=0.5,
     help="EMA smoothing coefficient for periodic weight refreshes",
+)
+common_parser.add_argument(
+    "--psmgd-dynamic-threshold",
+    type=float,
+    default=None,
+    help="selected metric threshold for dynamic PSMGD solver refreshes",
+)
+common_parser.add_argument(
+    "--psmgd-dynamic-metric",
+    type=str,
+    choices=["refresh_rel_fro", "step_rel_fro"],
+    default="refresh_rel_fro",
+    help="metric used by dynamic PSMGD solver refreshes",
+)
+common_parser.add_argument(
+    "--psmgd-dynamic-direction",
+    type=str,
+    choices=["above", "below"],
+    default=None,
+    help="comparison direction used by dynamic PSMGD solver refreshes",
 )
 common_parser.add_argument(
     "--psmgd-update-every",
@@ -271,6 +307,19 @@ def resolve_composable_config_from_args(args):
     )
 
 
+def resolve_psmgd_dynamic_threshold_from_args(args):
+    if args.psmgd_dynamic_threshold is not None:
+        return args.psmgd_dynamic_threshold
+    direction = resolve_psmgd_dynamic_direction_from_args(args)
+    return DYNAMIC_PSMGD_DEFAULT_THRESHOLDS[args.psmgd_dynamic_metric][direction]
+
+
+def resolve_psmgd_dynamic_direction_from_args(args):
+    if args.psmgd_dynamic_direction is not None:
+        return args.psmgd_dynamic_direction
+    return DYNAMIC_PSMGD_DEFAULT_DIRECTIONS[args.psmgd_dynamic_metric]
+
+
 def build_experiment_output_stem(args):
     if "famo" in args.method:
         name = f"{args.method}_gamma{args.gamma}_wlr{args.method_params_lr}"
@@ -280,11 +329,22 @@ def build_experiment_output_stem(args):
 
     if args.method in ["modular", "compositional"]:
         config = resolve_composable_config_from_args(args)
+        psmgd_dynamic_direction = resolve_psmgd_dynamic_direction_from_args(args)
+        psmgd_dynamic_threshold = resolve_psmgd_dynamic_threshold_from_args(args)
         if config["scheduler"] == "psmgd_periodic":
             return (
                 f"{args.method}_{config['preprocessing']}_{config['solver']}"
                 f"_alpha{args.alpha}_beta{args.beta}"
                 f"_psmgd_R{args.psmgd_R}_a{args.psmgd_alpha}_sd{args.seed}"
+            )
+        if config["scheduler"] == "psmgd_dynamic":
+            return (
+                f"{args.method}_{config['preprocessing']}_beta{args.beta}"
+                f"_{config['solver']}_alpha{args.alpha}"
+                f"_psmgd_dynamic_{args.psmgd_dynamic_metric}"
+                f"_{psmgd_dynamic_direction}"
+                f"_thr{psmgd_dynamic_threshold}"
+                f"_a{args.psmgd_alpha}_sd{args.seed}"
             )
         return (
             f"{args.method}_{config['preprocessing']}_{config['solver']}"
@@ -305,6 +365,8 @@ def build_experiment_output_stem(args):
 
 def extract_weight_method_parameters_from_args(args):
     composable_config = resolve_composable_config_from_args(args)
+    psmgd_dynamic_direction = resolve_psmgd_dynamic_direction_from_args(args)
+    psmgd_dynamic_threshold = resolve_psmgd_dynamic_threshold_from_args(args)
 
     weight_methods_parameters = defaultdict(dict)
     weight_methods_parameters.update(
@@ -329,6 +391,9 @@ def extract_weight_method_parameters_from_args(args):
                 beta=args.beta,
                 psmgd_R=args.psmgd_R,
                 psmgd_alpha=args.psmgd_alpha,
+                psmgd_dynamic_threshold=psmgd_dynamic_threshold,
+                psmgd_dynamic_metric=args.psmgd_dynamic_metric,
+                psmgd_dynamic_direction=psmgd_dynamic_direction,
                 alpha=args.alpha,
                 c=args.c,
                 nashmtl_optim_niter=args.nashmtl_optim_niter,
@@ -341,6 +406,9 @@ def extract_weight_method_parameters_from_args(args):
                 beta=args.beta,
                 psmgd_R=args.psmgd_R,
                 psmgd_alpha=args.psmgd_alpha,
+                psmgd_dynamic_threshold=psmgd_dynamic_threshold,
+                psmgd_dynamic_metric=args.psmgd_dynamic_metric,
+                psmgd_dynamic_direction=psmgd_dynamic_direction,
                 alpha=args.alpha,
                 c=args.c,
                 nashmtl_optim_niter=args.nashmtl_optim_niter,
