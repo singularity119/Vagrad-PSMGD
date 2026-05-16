@@ -28,13 +28,13 @@ if [[ -n "${PSMGD_DYNAMIC_THRESHOLD:-}" ]]; then
 else
   case "${psmgd_dynamic_metric}:${psmgd_dynamic_direction}" in
     refresh_rel_fro:below)
-      psmgd_dynamic_threshold="1.0164316892623901"
+      psmgd_dynamic_threshold="1.016"
       ;;
     refresh_rel_fro:above)
-      psmgd_dynamic_threshold="1.098314642906189"
+      psmgd_dynamic_threshold="1.096"
       ;;
     step_rel_fro:below)
-      psmgd_dynamic_threshold="1.1187902688980103"
+      psmgd_dynamic_threshold="1.12"
       ;;
     step_rel_fro:above)
       psmgd_dynamic_threshold="1.76"
