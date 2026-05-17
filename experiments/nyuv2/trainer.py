@@ -208,7 +208,7 @@ def main(path, lr, bs, device):
         with torch.no_grad():  # operations inside don't track history
             test_dataset = iter(test_loader)
             for k in range(test_batch):
-                test_data, test_label, test_depth, test_normal = test_dataset.next()
+                test_data, test_label, test_depth, test_normal = next(test_dataset)
                 test_data, test_label = test_data.to(device), test_label.long().to(
                     device
                 )
